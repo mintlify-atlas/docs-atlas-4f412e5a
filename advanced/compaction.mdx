@@ -1,0 +1,252 @@
+---
+title: Compaction
+description: Understanding SlateDB's compaction architecture and strategies
+---
+
+Compaction in SlateDB merges SSTs (Sorted String Tables) to reduce space amplification by removing old versions and tombstones, and to reduce read amplification by decreasing the number of SSTs that need to be searched during reads.
+
+## Architecture Overview
+
+SlateDB's compaction system consists of three main components:
+
+- **Compaction Scheduler**: Decides which SSTs and sorted runs to compact
+- **Compaction Executor**: Executes the compaction work by merging data
+- **Compaction Event Handler**: Orchestrates the compaction lifecycle
+
+### Storage Layers
+
+SlateDB organizes data into two main layers:
+
+1. **L0 (Level 0)**: Recently flushed SSTs from the memtable that may have overlapping key ranges
+2. **Sorted Runs (SR)**: Compacted SSTs organized into runs with non-overlapping key ranges within each run
+
+```
+┌─────────────────────────────────────────────────┐
+│  L0 (newest data)                               │
+│  ┌─────┐ ┌─────┐ ┌─────┐ ┌─────┐                │
+│  │SST 4│ │SST 3│ │SST 2│ │SST 1│                │
+│  └─────┘ └─────┘ └─────┘ └─────┘                │
+├─────────────────────────────────────────────────┤
+│  Sorted Runs (compacted, older data below)      │
+│                                                 │
+│  SR 10 (newest)  ──►  SR 5  ──►  SR 0 (oldest)  │
+└─────────────────────────────────────────────────┘
+```
+
+## Compaction Process
+
+### WAL to L0 Compaction
+
+The main writer compacts the WAL directly to L0 from memory without reading back from object storage:
+
+1. Incoming writes accumulate in the memtable
+2. When the memtable reaches `l0_sst_size_bytes`, it's frozen and written as an L0 SST
+3. The manifest is updated with the new L0 SSTs periodically based on `l0_manifest_commit_interval_ms`
+4. If L0 SSTs exceed `l0_max_ssts`, writes are paused until compaction catches up
+
+This approach saves network bandwidth and offloads some compaction work from the compactor to the writer.
+
+### L0 and Lower Level Compaction
+
+The compactor process handles compacting L0 and sorted runs:
+
+1. The scheduler proposes compactions based on the current database state
+2. The executor validates and executes the compaction by:
+   - Reading source SSTs and sorted runs
+   - Sort-merging entries
+   - Applying retention policies and merge operators
+   - Writing output SSTs to the destination sorted run
+3. The manifest is updated atomically with the new sorted run
+
+**Key Implementation Details** (see `compactor_executor.rs:388-459`):
+
+- Compaction jobs can be resumed if interrupted by tracking output SSTs
+- Progress is reported periodically to update `bytes_processed` metrics
+- The iterator pipeline processes entries one at a time through merge, retention, and filter layers
+- SST rollover occurs when `max_sst_size` is exceeded (preventing single keys from spanning SSTs)
+
+## Size-Tiered Compaction
+
+SlateDB uses a size-tiered compaction strategy by default. This strategy:
+
+- Groups sorted runs into levels based on size
+- Compacts runs when a level accumulates too many runs
+- Balances write amplification against read/space amplification
+
+### Compaction Selection
+
+The size-tiered scheduler (`size_tiered_compaction.rs:179-319`) selects compactions based on:
+
+1. **L0 Compaction**: Triggered when L0 has ≥ `min_compaction_sources` SSTs and L1 has capacity
+2. **Sorted Run Compaction**: Merges runs of similar size when a level accumulates ≥ `min_compaction_sources` runs
+
+```rust
+// Example: Compact L0 SSTs to a new sorted run
+let sources = vec![
+    SourceId::Sst(sst_4),
+    SourceId::Sst(sst_3),
+    SourceId::Sst(sst_2),
+    SourceId::Sst(sst_1),
+];
+let destination = 11; // New sorted run ID
+let spec = CompactionSpec::new(sources, destination);
+```
+
+### Validation Rules
+
+Compactions must satisfy these constraints (`size_tiered_compaction.rs:208-266`):
+
+- Sources must be logically consecutive (no gaps in L0/SR order)
+- If compacting sorted runs, destination must be the lowest-ID SR among sources
+- If compacting only L0, destination must be a new SR ID > highest existing SR ID
+
+## Configuration
+
+### Compactor Options
+
+```rust
+use slatedb::config::{CompactorOptions, SizeTieredCompactionSchedulerOptions};
+
+let compactor_options = CompactorOptions {
+    max_concurrent_compactions: 4,
+    max_sst_size: 64 * 1024 * 1024, // 64MB
+    poll_interval: Duration::from_secs(5),
+    scheduler_options: SizeTieredCompactionSchedulerOptions {
+        min_compaction_sources: 4,
+        max_compaction_sources: 8,
+        include_size_threshold: 4.0,
+    }.into(),
+};
+```
+
+### Key Parameters
+
+- **max_concurrent_compactions**: Maximum number of compactions running simultaneously
+- **max_sst_size**: Target size for output SSTs (actual size may vary slightly)
+- **min_compaction_sources**: Minimum number of sources to trigger compaction
+- **max_compaction_sources**: Maximum sources to include in a single compaction
+- **include_size_threshold**: Size ratio threshold for grouping runs into levels
+
+## Backpressure
+
+Backpressure prevents unbounded read/space amplification:
+
+1. **L0 Backpressure**: Writes pause when L0 SSTs exceed `l0_max_ssts`
+2. **Level Backpressure**: Compactions to a level block when it exceeds `max_compaction_sources` runs
+
+This ensures compaction can keep up with write throughput.
+
+## Monitoring
+
+Compaction metrics (`compactor.rs:968-1025`):
+
+```rust
+// Metrics exposed by the compactor
+pub const BYTES_COMPACTED: &str = "compactor.bytes_compacted";
+pub const LAST_COMPACTION_TS_SEC: &str = "compactor.last_compaction_timestamp_sec";
+pub const RUNNING_COMPACTIONS: &str = "compactor.running_compactions";
+pub const TOTAL_BYTES_BEING_COMPACTED: &str = "compactor.total_bytes_being_compacted";
+pub const TOTAL_THROUGHPUT_BYTES_PER_SEC: &str = "compactor.total_throughput_bytes_per_sec";
+```
+
+## Amplification Trade-offs
+
+SlateDB's compaction balances three types of amplification:
+
+### Write Amplification
+
+- **Definition**: Amount of data rewritten during compaction relative to original writes
+- **SlateDB Impact**: Lower than leveled compaction due to tiered strategy
+- **Network Cost**: Primary concern is network bandwidth, not object storage cost (no charges for standard-tier transfers)
+
+### Read Amplification
+
+- **Definition**: Number of SSTs searched during reads
+- **SlateDB Impact**: Mitigated by bloom filters and caching
+- **Optimization**: Keeping SR count low enough for filters/indexes to fit in memory
+
+### Space Amplification
+
+- **Definition**: Ratio of stored data to logical data size
+- **SlateDB Impact**: Less critical due to cheap object storage (~1/5 to 1/20 the cost of EBS)
+- **Consideration**: Higher amplification increases cache requirements for good read performance
+
+## Advanced Topics
+
+### Manual Compaction
+
+Trigger a full compaction of the entire database:
+
+```rust
+use slatedb::compactor::CompactionRequest;
+
+// Compact all L0 SSTs and sorted runs
+let request = CompactionRequest::Full;
+let compaction_id = db.submit_compaction(request).await?;
+```
+
+### Compaction State Persistence
+
+Compactions are tracked in the compactions store to enable resumption after restart:
+
+- Each compaction has a unique ULID identifier
+- Output SSTs are tracked to resume from the last completed key range
+- Failed compactions are marked and can be retried
+
+### Running a Standalone Compactor
+
+For production deployments, run the compactor separately:
+
+```rust
+use slatedb::compactor::Compactor;
+
+let compactor = Compactor::new(
+    manifest_store,
+    compactions_store,
+    table_store,
+    compactor_options,
+    scheduler_supplier,
+    compactor_runtime,
+    rand,
+    stat_registry,
+    system_clock,
+    closed_result_writer,
+    merge_operator,
+);
+
+compactor.run().await?;
+```
+
+## Performance Considerations
+
+### Network Bandwidth
+
+Compaction is typically bounded by network throughput:
+
+- AWS instances have baseline and burst network capacity
+- Example: m5d.xlarge has 160 MBps baseline, 1280 MBps burst
+- Compaction can use burst capacity for short-lived jobs
+
+### Concurrency
+
+Adjust `max_concurrent_compactions` based on:
+
+- Available network bandwidth
+- Number of compactor workers
+- Workload characteristics (write-heavy vs read-heavy)
+
+Typically 2-8 concurrent compactions work well for most workloads.
+
+## Future Enhancements
+
+Planned improvements include:
+
+- **Lazy Leveling**: Maintain a single SR at the lowest level to reduce space amplification
+- **Time-Series Optimization**: Specialized compaction for time-bucketed data
+- **Distributed Compaction**: Provision temporary large instances for expensive compactions
+
+## Related Documentation
+
+- [Garbage Collection](/advanced/garbage-collection) - Cleaning up obsolete SSTs
+- [Compaction Filters](/advanced/compaction-filters) - Custom entry filtering
+- [Write-Ahead Log](/advanced/wal) - Understanding WAL to L0 flow

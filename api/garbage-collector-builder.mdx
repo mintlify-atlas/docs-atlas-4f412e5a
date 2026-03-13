@@ -1,0 +1,303 @@
+---
+title: GarbageCollectorBuilder
+description: API reference for GarbageCollectorBuilder, used to construct a standalone garbage collector process
+---
+
+## Overview
+
+The `GarbageCollectorBuilder` is used to construct and configure a standalone garbage collector process that removes obsolete data from SlateDB storage. The garbage collector handles:
+
+- Write-ahead log (WAL) SSTs no longer referenced by active manifests or checkpoints
+- Compacted SSTs no longer referenced by active manifests or checkpoints
+- Old manifest files not needed for recovery or checkpoints
+- Old compaction files no longer needed
+
+<Note>
+The garbage collector can run as part of the database process or as a standalone process. Running it standalone is recommended for production deployments to isolate resource usage.
+</Note>
+
+## Constructor
+
+Create a new `GarbageCollectorBuilder` through the database builder:
+
+```rust
+use slatedb::db::builder::GarbageCollectorBuilder;
+
+let gc_builder = GarbageCollectorBuilder::new(
+    path,
+    object_store,
+    gc_options,
+);
+```
+
+<ParamField path="path" type="impl Into<Path>" required>
+  The path to the database in object storage.
+</ParamField>
+
+<ParamField path="object_store" type="Arc<dyn ObjectStore>" required>
+  The object store where database files are stored.
+</ParamField>
+
+<ParamField path="gc_options" type="GarbageCollectorOptions" required>
+  Configuration options for the garbage collector.
+</ParamField>
+
+## Configuration Options
+
+The `GarbageCollectorOptions` struct configures garbage collection behavior:
+
+```rust
+pub struct GarbageCollectorOptions {
+    pub manifest_options: Option<GarbageCollectorDirectoryOptions>,
+    pub wal_options: Option<GarbageCollectorDirectoryOptions>,
+    pub compacted_options: Option<GarbageCollectorDirectoryOptions>,
+    pub compactions_options: Option<GarbageCollectorDirectoryOptions>,
+}
+```
+
+<ParamField path="manifest_options" type="Option<GarbageCollectorDirectoryOptions>">
+  GC options for manifest files. Set to `None` to disable manifest GC.
+  
+  **Default:** Enabled with 5-minute interval and 1-day min age
+</ParamField>
+
+<ParamField path="wal_options" type="Option<GarbageCollectorDirectoryOptions>">
+  GC options for WAL SSTs. Set to `None` to disable WAL GC.
+  
+  **Default:** Enabled with 1-minute interval and 1-minute min age
+</ParamField>
+
+<ParamField path="compacted_options" type="Option<GarbageCollectorDirectoryOptions>">
+  GC options for compacted SSTs. Set to `None` to disable compacted SST GC.
+  
+  **Default:** Enabled with 5-minute interval and 1-day min age
+</ParamField>
+
+<ParamField path="compactions_options" type="Option<GarbageCollectorDirectoryOptions>">
+  GC options for compaction files. Set to `None` to disable compaction file GC.
+  
+  **Default:** Enabled with 5-minute interval and 1-day min age
+</ParamField>
+
+### GarbageCollectorDirectoryOptions
+
+Per-directory garbage collection settings:
+
+```rust
+pub struct GarbageCollectorDirectoryOptions {
+    pub interval: Option<Duration>,
+    pub min_age: Duration,
+}
+```
+
+<ResponseField name="interval" type="Option<Duration>">
+  Interval for background GC runs. Set to `None` to disable recurring GC.
+  
+  **Default:** `Some(Duration::from_secs(60))`
+</ResponseField>
+
+<ResponseField name="min_age" type="Duration">
+  Minimum age of a file before it can be garbage collected.
+  
+  **Default:** `Duration::from_secs(300)`
+</ResponseField>
+
+## Build and Run
+
+### build()
+
+Builds the garbage collector instance.
+
+```rust
+pub async fn build(self) -> Result<GarbageCollector, Error>
+```
+
+#### Returns
+
+A configured `GarbageCollector` instance ready to run.
+
+#### Errors
+
+Returns an error if:
+- The manifest cannot be loaded
+- The object store is inaccessible
+- The configuration is invalid
+
+### Running the Garbage Collector
+
+The garbage collector can be run in two modes:
+
+#### 1. As an Async Task
+
+Run continuously in the background:
+
+```rust
+let gc = gc_builder.build().await?;
+
+// In your main application
+tokio::spawn(async move {
+    gc.run_async_task().await
+});
+```
+
+#### 2. One-Time Execution
+
+Run garbage collection once:
+
+```rust
+let gc = gc_builder.build().await?;
+gc.run_gc_once().await;
+```
+
+## Complete Example
+
+```rust
+use std::sync::Arc;
+use std::time::Duration;
+use object_store::memory::InMemory;
+use slatedb::config::{
+    GarbageCollectorOptions,
+    GarbageCollectorDirectoryOptions,
+};
+use slatedb::db::builder::GarbageCollectorBuilder;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let object_store = Arc::new(InMemory::new());
+    let path = "/my/db";
+    
+    // Configure GC with custom settings
+    let gc_options = GarbageCollectorOptions {
+        manifest_options: Some(GarbageCollectorDirectoryOptions {
+            interval: Some(Duration::from_secs(300)), // 5 minutes
+            min_age: Duration::from_secs(86400),      // 24 hours
+        }),
+        wal_options: Some(GarbageCollectorDirectoryOptions {
+            interval: Some(Duration::from_secs(60)),  // 1 minute
+            min_age: Duration::from_secs(60),         // 1 minute
+        }),
+        compacted_options: Some(GarbageCollectorDirectoryOptions {
+            interval: Some(Duration::from_secs(300)), // 5 minutes
+            min_age: Duration::from_secs(86400),      // 24 hours
+        }),
+        compactions_options: Some(GarbageCollectorDirectoryOptions {
+            interval: Some(Duration::from_secs(300)), // 5 minutes
+            min_age: Duration::from_secs(86400),      // 24 hours
+        }),
+    };
+    
+    let gc = GarbageCollectorBuilder::new(
+        path,
+        object_store,
+        gc_options,
+    )
+    .build()
+    .await?;
+    
+    // Run as async task
+    gc.run_async_task().await?;
+    
+    Ok(())
+}
+```
+
+## Garbage Collection Process
+
+### Manifest GC
+
+1. Lists all manifest files
+2. Identifies the latest manifest and any manifests referenced by active checkpoints
+3. Deletes manifests older than `min_age` that are not referenced
+4. Always retains the latest manifest
+
+### WAL GC
+
+1. Reads the latest manifest to find `replay_after_wal_id`
+2. Lists all WAL SSTs
+3. Deletes WAL SSTs older than `min_age` with IDs ≤ `replay_after_wal_id`
+4. Retains WAL SSTs referenced by active checkpoints
+
+### Compacted SST GC
+
+1. Reads the latest manifest and all checkpoint-referenced manifests
+2. Builds a set of all referenced compacted SSTs
+3. Lists all compacted SSTs in object storage
+4. Deletes SSTs older than `min_age` that are not in the referenced set
+5. Also checks active compactions to avoid deleting SSTs being written
+
+### Compaction File GC
+
+1. Lists all compaction files (`.compactions`)
+2. Deletes all but the latest file that are older than `min_age`
+3. Always retains the latest compaction file
+
+## Checkpoint Protection
+
+The garbage collector protects data referenced by active checkpoints:
+
+- Manifest files referenced by checkpoints are retained
+- WAL SSTs needed for checkpoint recovery are retained  
+- Compacted SSTs in checkpoint-referenced manifests are retained
+
+<Warning>
+Ensure that checkpoint lifetimes are shorter than the garbage collection `min_age` for the corresponding file type, or files may be deleted while still needed by checkpoints.
+</Warning>
+
+## Expired Checkpoint Removal
+
+The garbage collector also removes expired checkpoints from the manifest. A checkpoint is considered expired if:
+
+- It has an `expire_time` set
+- The current time is past the `expire_time`
+
+This happens during each GC run before collecting files.
+
+## Metrics
+
+The garbage collector exposes metrics for monitoring:
+
+<ResponseField name="gc.count" type="Counter">
+  Total number of GC runs.
+</ResponseField>
+
+<ResponseField name="gc.manifest_count" type="Counter">
+  Total number of manifest files deleted.
+</ResponseField>
+
+<ResponseField name="gc.wal_count" type="Counter">
+  Total number of WAL SSTs deleted.
+</ResponseField>
+
+<ResponseField name="gc.compacted_count" type="Counter">
+  Total number of compacted SSTs deleted.
+</ResponseField>
+
+<ResponseField name="gc.compactions_count" type="Counter">
+  Total number of compaction files deleted.
+</ResponseField>
+
+## Best Practices
+
+### Safety Margins
+
+- Set `min_age` values conservatively to avoid deleting files still in use
+- Use longer `min_age` for manifests and compacted SSTs (e.g., 24 hours)
+- Use shorter `min_age` for WAL files (e.g., 1 minute) since they're quickly superseded
+
+### Checkpoint Coordination
+
+- Ensure checkpoint lifetimes are shorter than GC `min_age` settings
+- Monitor checkpoint creation and expiration
+- Set checkpoint lifetimes based on recovery requirements
+
+### Resource Usage
+
+- Adjust GC intervals based on write rate and storage costs
+- Run GC less frequently for cold databases
+- Monitor object storage costs and adjust accordingly
+
+### High Availability
+
+- Only one garbage collector instance should run per database
+- Use health checks and automatic restart on failure
+- Monitor GC metrics to detect issues

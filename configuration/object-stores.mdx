@@ -1,0 +1,402 @@
+---
+title: Object Stores
+description: Configure SlateDB with different object storage backends
+---
+
+SlateDB is built on top of object storage and supports any storage backend that implements the [object_store](https://docs.rs/object_store) crate interface. This includes AWS S3, Google Cloud Storage, Azure Blob Storage, MinIO, and more.
+
+## AWS S3
+
+Use the `AmazonS3Builder` to configure an S3-compatible object store:
+
+```rust
+use object_store::aws::{AmazonS3Builder, S3ConditionalPut};
+use slatedb::Db;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let object_store = Arc::new(
+        AmazonS3Builder::new()
+            .with_bucket_name("my-slatedb-bucket")
+            .with_region("us-east-1")
+            .with_access_key_id("your-access-key")
+            .with_secret_access_key("your-secret-key")
+            .with_conditional_put(S3ConditionalPut::ETagMatch)
+            .build()?,
+    );
+
+    let db = Db::open("/path/to/db", object_store).await?;
+    
+    // Use the database
+    db.put(b"key", b"value").await?;
+    
+    db.close().await?;
+    Ok(())
+}
+```
+
+### Required Configuration
+
+<ParamField path="bucket_name" type="String" required>
+  The name of the S3 bucket to use for storage.
+</ParamField>
+
+<ParamField path="region" type="String" required>
+  The AWS region where your bucket is located (e.g., `us-east-1`, `eu-west-1`).
+</ParamField>
+
+### Authentication Options
+
+<ParamField path="access_key_id" type="String">
+  AWS access key ID. If not provided, the builder will attempt to use credentials from the environment or IAM roles.
+</ParamField>
+
+<ParamField path="secret_access_key" type="String">
+  AWS secret access key. Required if `access_key_id` is provided.
+</ParamField>
+
+### Important Settings
+
+<ParamField path="conditional_put" type="S3ConditionalPut">
+  **Critical**: Must be set to `S3ConditionalPut::ETagMatch` for SlateDB to work correctly. This ensures atomic conditional writes are supported.
+
+  ```rust
+  .with_conditional_put(S3ConditionalPut::ETagMatch)
+  ```
+</ParamField>
+
+## S3-Compatible Storage (MinIO, LocalStack)
+
+For S3-compatible storage like MinIO or LocalStack, use the same builder with additional endpoint configuration:
+
+```rust
+use object_store::aws::{AmazonS3Builder, S3ConditionalPut};
+use slatedb::Db;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let object_store = Arc::new(
+        AmazonS3Builder::new()
+            .with_endpoint("http://localhost:4566")  // LocalStack endpoint
+            .with_allow_http(true)                    // Allow HTTP for local development
+            .with_bucket_name("slatedb")
+            .with_region("us-east-1")
+            .with_access_key_id("test")
+            .with_secret_access_key("test")
+            .with_conditional_put(S3ConditionalPut::ETagMatch)
+            .build()?,
+    );
+
+    let db = Db::open("/tmp/slatedb_local", object_store).await?;
+    db.put(b"key", b"value").await?;
+    db.close().await?;
+    
+    Ok(())
+}
+```
+
+<ParamField path="endpoint" type="String">
+  Custom endpoint URL for S3-compatible services. Required for MinIO, LocalStack, and other S3-compatible storage.
+</ParamField>
+
+<ParamField path="allow_http" type="bool" default="false">
+  Allow HTTP connections instead of HTTPS. Useful for local development with MinIO or LocalStack.
+  
+  <Warning>Never use `allow_http(true)` in production environments.</Warning>
+</ParamField>
+
+## Google Cloud Storage
+
+Use the `GoogleCloudStorageBuilder` to configure GCS:
+
+```rust
+use object_store::gcp::GoogleCloudStorageBuilder;
+use slatedb::Db;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let gcs_store = Arc::new(
+        GoogleCloudStorageBuilder::new()
+            .with_service_account_path("/path/to/service-account.json")
+            .with_bucket_name("my-slatedb-bucket")
+            .build()?,
+    );
+
+    let db = Db::open("/path/to/db", gcs_store).await?;
+    db.put(b"key", b"value").await?;
+    db.close().await?;
+    
+    Ok(())
+}
+```
+
+### Required Configuration
+
+<ParamField path="bucket_name" type="String" required>
+  The name of the GCS bucket to use for storage.
+</ParamField>
+
+### Authentication Options
+
+<ParamField path="service_account_path" type="String">
+  Path to a service account JSON key file. If not provided, the builder will attempt to use Application Default Credentials.
+</ParamField>
+
+<ParamField path="service_account_key" type="String">
+  Service account JSON key as a string (alternative to `service_account_path`).
+</ParamField>
+
+## Azure Blob Storage
+
+Use the `MicrosoftAzureBuilder` to configure Azure Blob Storage:
+
+```rust
+use object_store::azure::MicrosoftAzureBuilder;
+use slatedb::Db;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let blob_store = Arc::new(
+        MicrosoftAzureBuilder::new()
+            .with_account("mystorageaccount")
+            .with_access_key("your-access-key")
+            .with_container_name("slatedb-container")
+            .build()?,
+    );
+
+    let db = Db::open("/path/to/db", blob_store).await?;
+    db.put(b"key", b"value").await?;
+    db.close().await?;
+    
+    Ok(())
+}
+```
+
+### Required Configuration
+
+<ParamField path="account" type="String" required>
+  The Azure storage account name.
+</ParamField>
+
+<ParamField path="container_name" type="String" required>
+  The name of the blob container to use for storage.
+</ParamField>
+
+### Authentication Options
+
+<ParamField path="access_key" type="String">
+  Azure storage account access key.
+</ParamField>
+
+<ParamField path="client_id" type="String">
+  Azure client ID for Azure Active Directory authentication.
+</ParamField>
+
+<ParamField path="client_secret" type="String">
+  Azure client secret for Azure Active Directory authentication.
+</ParamField>
+
+<ParamField path="tenant_id" type="String">
+  Azure tenant ID for Azure Active Directory authentication.
+</ParamField>
+
+## In-Memory Storage (Testing)
+
+For testing and development, you can use an in-memory object store:
+
+```rust
+use object_store::memory::InMemory;
+use slatedb::Db;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let object_store = Arc::new(InMemory::new());
+    
+    let db = Db::open("/tmp/test-db", object_store).await?;
+    db.put(b"key", b"value").await?;
+    
+    // Data exists only in memory
+    assert_eq!(db.get(b"key").await?.unwrap(), b"value");
+    
+    db.close().await?;
+    Ok(())
+}
+```
+
+<Warning>
+  The in-memory store should only be used for testing. All data is lost when the process exits.
+</Warning>
+
+## Local File System
+
+For development or edge deployments, you can use a local file system as object storage:
+
+```rust
+use object_store::local::LocalFileSystem;
+use slatedb::Db;
+use std::sync::Arc;
+use std::path::PathBuf;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let object_store = Arc::new(
+        LocalFileSystem::new_with_prefix("/tmp/slatedb-objects")?,
+    );
+    
+    let db = Db::open("/tmp/slatedb", object_store).await?;
+    db.put(b"key", b"value").await?;
+    db.close().await?;
+    
+    Ok(())
+}
+```
+
+<Note>
+  LocalFileSystem is useful for testing and edge deployments but lacks the durability and availability guarantees of cloud object storage.
+</Note>
+
+## Custom Object Stores
+
+SlateDB can work with any implementation of the `object_store::ObjectStore` trait. To use a custom object store:
+
+```rust
+use object_store::ObjectStore;
+use slatedb::Db;
+use std::sync::Arc;
+
+struct MyCustomObjectStore {
+    // your implementation
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for MyCustomObjectStore {
+    // implement required methods
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(MyCustomObjectStore { /* ... */ });
+    let db = Db::open("/path/to/db", object_store).await?;
+    
+    // Use the database
+    db.close().await?;
+    Ok(())
+}
+```
+
+## Performance Considerations
+
+### Latency
+
+Object store latency varies significantly by provider and region:
+
+- **S3 US-East-1**: ~20-50ms for GET/PUT operations
+- **S3 Cross-Region**: 100-200ms+
+- **GCS**: Similar to S3, ~20-50ms in the same region
+- **Azure Blob**: ~25-60ms in the same region
+- **MinIO (local)**: Less than 5ms
+
+SlateDB's architecture is designed to minimize the impact of object store latency through:
+
+- Local disk caching (see [Caching Configuration](/configuration/caching))
+- Batched writes
+- Asynchronous background operations
+
+### Costs
+
+Object storage costs include:
+
+1. **Storage costs**: Based on data volume ($/GB-month)
+2. **Request costs**: PUT, GET, LIST operations
+3. **Data transfer costs**: Egress charges
+
+SlateDB's configuration allows you to tune the trade-off between performance and costs. For example:
+
+- Increasing `flush_interval` reduces PUT costs but increases write latency
+- Increasing `l0_sst_size_bytes` reduces the number of objects created
+- Enabling local caching reduces GET requests
+
+### Throughput
+
+Object stores typically provide:
+
+- **S3**: 3,500 PUT/s and 5,500 GET/s per prefix
+- **GCS**: Similar to S3
+- **Azure**: Varies by account type
+
+For higher throughput, consider:
+
+- Using multiple DB instances with different path prefixes
+- Tuning `max_concurrent_compactions` for better compaction throughput
+- Enabling disk caching to reduce GET operations
+
+## Best Practices
+
+### Authentication
+
+<Tip>
+  Use environment-based authentication (IAM roles, service accounts) in production instead of hardcoding credentials.
+</Tip>
+
+```rust
+// Good: Use IAM role (no credentials in code)
+let object_store = Arc::new(
+    AmazonS3Builder::new()
+        .with_bucket_name("my-bucket")
+        .with_region("us-east-1")
+        .with_conditional_put(S3ConditionalPut::ETagMatch)
+        .build()?,
+);
+
+// Bad: Hardcoded credentials
+let object_store = Arc::new(
+    AmazonS3Builder::new()
+        .with_access_key_id("AKIAIOSFODNN7EXAMPLE")  // Never do this!
+        .with_secret_access_key("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY")
+        // ...
+);
+```
+
+### Regional Considerations
+
+<Tip>
+  Deploy SlateDB in the same region as your object storage to minimize latency and data transfer costs.
+</Tip>
+
+### Bucket Configuration
+
+For production deployments:
+
+1. **Enable versioning**: Protects against accidental deletions
+2. **Set up lifecycle policies**: Automate old data archival
+3. **Enable access logging**: Monitor access patterns
+4. **Configure CORS**: If accessing from web applications
+5. **Set appropriate permissions**: Use least-privilege access
+
+### Path Organization
+
+SlateDB creates objects with the following structure:
+
+```
+<path>/
+├── manifest/
+│   ├── 00000000000000000001.manifest
+│   └── 00000000000000000002.manifest
+├── wal/
+│   └── <wal-files>
+├── compacted/
+│   └── <sst-files>
+└── .compactions
+```
+
+When using shared buckets, use distinct path prefixes for different databases:
+
+```rust
+let db1 = Db::open("/db1", object_store.clone()).await?;
+let db2 = Db::open("/db2", object_store.clone()).await?;
+```

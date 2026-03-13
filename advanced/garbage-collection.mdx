@@ -1,0 +1,406 @@
+---
+title: Garbage Collection
+description: How SlateDB cleans up obsolete data from object storage
+---
+
+SlateDB's garbage collector removes obsolete data from object storage to reclaim space and reduce costs. It runs periodically in the background with configurable intervals and minimum age thresholds.
+
+## Overview
+
+The garbage collector cleans up four types of data:
+
+1. **WAL SSTs**: Write-ahead log files no longer referenced by manifests or checkpoints
+2. **Compacted SSTs**: L0 and sorted run SSTs no longer referenced by manifests or checkpoints  
+3. **Old Manifests**: Historical manifests not needed for recovery or checkpoints
+4. **Old Compactions Files**: Historical compaction state files no longer needed
+
+## Architecture
+
+The garbage collector (`garbage_collector.rs:81-233`) consists of:
+
+- **Main GC Process**: Coordinates all GC tasks and manages checkpoint expiration
+- **Specialized GC Tasks**: Handle WAL, compacted SSTs, manifests, and compactions independently
+- **Configuration**: Per-resource min_age and interval settings
+
+```
+┌─────────────────────────────────────────────┐
+│  GarbageCollector                           │
+├─────────────────────────────────────────────┤
+│  - WalGcTask                                │
+│  - CompactedGcTask                          │
+│  - ManifestGcTask                           │
+│  - CompactionsGcTask                        │
+└─────────────────────────────────────────────┘
+         │
+         ├─► Removes expired checkpoints first
+         ├─► Runs each GC task on its schedule
+         └─► Respects active checkpoints
+```
+
+## WAL Garbage Collection
+
+WAL files are deleted when they meet all these conditions:
+
+1. **Age**: File is older than `min_age` (default 5 minutes)
+2. **Manifest**: File ID ≤ `replay_after_wal_id` in the current manifest
+3. **Checkpoints**: Not referenced by any active checkpoint
+
+**Implementation** (`wal_gc.rs`):
+
+```rust
+// WAL GC only keeps files after replay_after_wal_id
+let min_wal_id = manifest.core.replay_after_wal_id + 1;
+
+// Also keep WALs referenced by checkpoints
+for checkpoint in &manifest.core.checkpoints {
+    let checkpoint_manifest = read_manifest(checkpoint.manifest_id)?;
+    let checkpoint_min_wal = checkpoint_manifest.core.replay_after_wal_id + 1;
+    min_wal_id = min_wal_id.min(checkpoint_min_wal);
+}
+
+// Delete WALs with ID < min_wal_id that are old enough
+delete_wals_before(min_wal_id, min_age)?;
+```
+
+**Key Points**:
+
+- The last flushed WAL is always kept even if expired
+- Checkpoints prevent deletion of WALs needed for point-in-time recovery
+- `min_age` prevents deletion of recently written files that might still be in use
+
+## Compacted SST Garbage Collection  
+
+Compacted SSTs (L0 and sorted runs) are deleted when:
+
+1. **Age**: SST is older than `min_age` (default 5 minutes)  
+2. **Manifest**: Not referenced by the current manifest's L0 or sorted runs
+3. **Checkpoints**: Not referenced by any active checkpoint
+4. **Compactions**: Not referenced by any active compaction job
+
+**Implementation** (`compacted_gc.rs`):
+
+```rust
+// Build set of active SST IDs from manifest
+let active_ssts: HashSet<_> = manifest.core.l0
+    .iter()
+    .chain(manifest.core.compacted.iter().flat_map(|sr| &sr.ssts))
+    .map(|sst| sst.id)
+    .collect();
+
+// Add SSTs from checkpointed manifests
+for checkpoint in &manifest.core.checkpoints {
+    let checkpoint_manifest = read_manifest(checkpoint.manifest_id)?;
+    active_ssts.extend(checkpoint_manifest.core.l0.iter().map(|s| s.id));
+    active_ssts.extend(
+        checkpoint_manifest.core.compacted
+            .iter()
+            .flat_map(|sr| sr.ssts.iter().map(|s| s.id))
+    );
+}
+
+// Add SSTs from active compactions
+let compactions = compactions_store.load_latest()?;
+for compaction in compactions.active_compactions() {
+    active_ssts.extend(compaction.output_ssts().iter().map(|s| s.id));
+}
+
+// Delete SSTs not in active set that are old enough
+for sst in list_compacted_ssts()? {
+    if !active_ssts.contains(&sst.id) && is_old_enough(sst, min_age) {
+        delete_sst(sst.id)?;
+    }
+}
+```
+
+**Key Points**:
+
+- Uses ULID timestamps to determine SST age without extra object store metadata calls
+- Active compactions protect their input and output SSTs from deletion
+- Checkpoint references are transitively followed to protect all needed SSTs
+
+## Manifest Garbage Collection
+
+Manifest files are deleted when:
+
+1. **Age**: Manifest is older than `min_age` (default 5 minutes)
+2. **Current**: Not the latest manifest
+3. **Checkpoints**: Not referenced by any active checkpoint
+
+**Implementation** (`manifest_gc.rs`):
+
+```rust
+// Keep the latest manifest
+let latest_manifest_id = current_manifest_id;
+
+// Keep manifests referenced by checkpoints  
+let checkpoint_manifest_ids: HashSet<_> = manifest.core.checkpoints
+    .iter()
+    .map(|cp| cp.manifest_id)
+    .collect();
+
+// Delete old manifests not in the keep set
+for manifest_file in list_manifests()? {
+    if manifest_file.id != latest_manifest_id 
+        && !checkpoint_manifest_ids.contains(&manifest_file.id)
+        && is_old_enough(manifest_file, min_age) 
+    {
+        delete_manifest(manifest_file.id)?;
+    }
+}
+```
+
+**Key Points**:
+
+- The current manifest is never deleted
+- Checkpoint manifests are protected from deletion
+- Old manifests provide point-in-time recovery points when checkpointed
+
+## Compactions File Garbage Collection
+
+Compactions files track active and completed compaction jobs. The GC keeps:
+
+1. **Latest File**: Always keep the most recent compactions file
+2. **Age**: Delete files older than `min_age` (default 5 minutes)
+
+**Implementation** (`compactions_gc.rs`):
+
+```rust
+// List all compaction files
+let compaction_files = list_compactions()?;
+
+// Keep the latest one
+let latest_id = compaction_files.iter().map(|f| f.id).max();
+
+// Delete old files
+for file in compaction_files {
+    if file.id != latest_id && is_old_enough(file, min_age) {
+        delete_compactions_file(file.id)?;
+    }
+}
+```
+
+## Checkpoint Expiration
+
+Before running any GC task, the collector removes expired checkpoints (`garbage_collector.rs:268-303`):
+
+```rust
+let now = system_clock.now();
+let retained_checkpoints: Vec<_> = manifest.core.checkpoints
+    .iter()
+    .filter(|cp| match cp.expire_time {
+        Some(expire_time) => expire_time > now,
+        None => true, // Keep checkpoints without expiration
+    })
+    .cloned()
+    .collect();
+
+if retained_checkpoints.len() != manifest.core.checkpoints.len() {
+    // Update manifest with only retained checkpoints
+    update_manifest_checkpoints(retained_checkpoints)?;
+}
+```
+
+**Key Points**:
+
+- Checkpoints without `expire_time` are kept indefinitely
+- Expired checkpoints are removed atomically via manifest update
+- Checkpoint removal happens before resource GC to free up references
+
+## Configuration
+
+### Garbage Collector Options
+
+```rust
+use slatedb::config::{
+    GarbageCollectorOptions,
+    GarbageCollectorDirectoryOptions,
+};
+use std::time::Duration;
+
+let gc_options = GarbageCollectorOptions {
+    wal_options: Some(GarbageCollectorDirectoryOptions {
+        min_age: Duration::from_secs(300),  // 5 minutes
+        interval: Some(Duration::from_secs(60)),  // Run every minute
+    }),
+    compacted_options: Some(GarbageCollectorDirectoryOptions {
+        min_age: Duration::from_secs(3600),  // 1 hour  
+        interval: Some(Duration::from_secs(300)),  // Run every 5 minutes
+    }),
+    manifest_options: Some(GarbageCollectorDirectoryOptions {
+        min_age: Duration::from_secs(3600),  // 1 hour
+        interval: Some(Duration::from_secs(300)),  // Run every 5 minutes  
+    }),
+    compactions_options: Some(GarbageCollectorDirectoryOptions {
+        min_age: Duration::from_secs(300),  // 5 minutes
+        interval: Some(Duration::from_secs(60)),  // Run every minute
+    }),
+};
+
+let db = Db::builder("mydb", object_store)
+    .with_gc_options(gc_options)
+    .build()
+    .await?;
+```
+
+### Tuning Guidelines
+
+**min_age**:
+- **WAL**: 5-10 minutes to allow for in-flight writes and manifest updates
+- **Compacted SSTs**: 1-2 hours to protect active compactions and allow for checkpoint creation
+- **Manifests**: 1-2 hours to support debugging and point-in-time recovery
+- **Compactions**: 5-10 minutes since these are frequently updated
+
+**interval**:
+- More frequent = lower latency for reclaiming space, higher object store LIST costs
+- Less frequent = lower costs, more accumulated garbage between runs
+- Balance based on write rate and cost sensitivity
+
+## Running GC
+
+### Embedded Mode
+
+GC runs automatically when the database is created:
+
+```rust
+use slatedb::Db;
+
+let db = Db::open("mydb", object_store).await?;
+// GC starts automatically in the background
+```
+
+### Manual GC
+
+Run GC once manually:
+
+```rust
+let gc = db.garbage_collector();
+gc.run_gc_once().await;
+```
+
+### Standalone Mode  
+
+For production, run GC in a separate process:
+
+```rust
+use slatedb::garbage_collector::GarbageCollector;
+
+let gc = GarbageCollector::new(
+    manifest_store,
+    compactions_store,
+    table_store,
+    gc_options,
+    stat_registry,
+    system_clock,
+);
+
+// Run GC loop
+loop {
+    gc.run_gc_once().await;
+    tokio::time::sleep(Duration::from_secs(60)).await;
+}
+```
+
+## Safety Guarantees
+
+### Coordination with Other Components
+
+1. **Writers**: Writers fence older writers via the manifest `writer_epoch`
+2. **Compactor**: Compactor tracks active jobs and protects their SSTs
+3. **Checkpoints**: GC respects all active checkpoints transitively
+4. **Manifest Updates**: Atomic CAS ensures GC sees consistent state
+
+### Race Conditions
+
+The `min_age` threshold prevents these race conditions:
+
+- **Write-then-GC**: Writer creates SST → GC runs → Writer updates manifest
+  - Safe: GC won't delete recent SST due to `min_age`
+  
+- **Checkpoint-then-GC**: Checkpoint created → GC runs → Manifest updated
+  - Safe: GC refreshes manifest before deletion
+
+- **Compaction-then-GC**: Compaction writes SST → GC runs → Manifest updated
+  - Safe: Compaction jobs track output SSTs; GC checks active compactions
+
+## Monitoring
+
+### Metrics
+
+```rust
+pub const GC_COUNT: &str = "gc.gc_count";  
+pub const GC_WAL_COUNT: &str = "gc.gc_wal_count";
+pub const GC_COMPACTED_COUNT: &str = "gc.gc_compacted_count";
+pub const GC_MANIFEST_COUNT: &str = "gc.gc_manifest_count";
+pub const GC_COMPACTIONS_COUNT: &str = "gc.gc_compactions_count";
+```
+
+### Logging
+
+GC logs statistics every 60 seconds:
+
+```
+DEBUG garbage collector stats [manifest_count=42, wals_count=128, compacted_count=356, compactions_count=12]
+```
+
+## Performance Considerations
+
+### Object Store Costs
+
+GC incurs these costs:
+
+- **LIST**: One per resource type per interval (dominant cost for large databases)
+- **DELETE**: One per deleted object
+- **GET** (manifests/compactions): Read metadata to determine references
+
+**Optimization Tips**:
+- Use longer intervals to reduce LIST frequency
+- Consider separate WAL object store with aggressive GC for cost savings
+- Monitor LIST request count and adjust intervals if costs are high
+
+### Latency Impact  
+
+GC has minimal impact on read/write latency:
+
+- Runs asynchronously in background task
+- Uses separate tokio runtime (can be configured)
+- Object store operations don't block critical path
+
+## Advanced Topics
+
+### Checkpoint Lifecycle
+
+Checkpoints interact with GC in this lifecycle:
+
+1. **Creation**: Checkpoint captures manifest ID and optional expiration time
+2. **Active**: GC protects manifest and all referenced SSTs
+3. **Expiration**: Checkpoint is removed from manifest (if `expire_time` is set)
+4. **Cleanup**: Next GC run can delete manifest and SSTs if no other references exist
+
+### CDC and WAL Retention
+
+For CDC (Change Data Capture) workloads:
+
+- Set higher `wal_min_age` to retain WAL files longer
+- CDC consumers should track their position and copy WALs if needed
+- No built-in WAL pinning mechanism - consumers are responsible for retention
+
+See [Change Data Capture](/advanced/change-data-capture) for details.
+
+### Debugging
+
+Disable GC temporarily for debugging:
+
+```rust  
+let gc_options = GarbageCollectorOptions {
+    wal_options: None,  // Disable WAL GC
+    compacted_options: None,  // Disable compacted SST GC
+    manifest_options: None,  // Disable manifest GC
+    compactions_options: None,  // Disable compactions GC
+};
+```
+
+## Related Documentation
+
+- [Compaction](/advanced/compaction) - Understanding what creates garbage
+- [Checkpoints](/operations/checkpoints) - Point-in-time snapshots
+- [Write-Ahead Log](/advanced/wal) - WAL lifecycle and flushing

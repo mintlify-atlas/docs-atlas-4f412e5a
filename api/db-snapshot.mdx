@@ -1,0 +1,364 @@
+---
+title: 'DbSnapshot'
+description: 'Read-only snapshot of the database at a point in time'
+---
+
+The `DbSnapshot` struct provides a read-only view of the database at a specific point in time.
+
+## Creating a Snapshot
+
+```rust
+let snapshot = db.snapshot().await?;
+```
+
+## Read Operations
+
+### get
+
+```rust
+pub async fn get<K: AsRef<[u8]> + Send>(&self, key: K) -> Result<Option<Bytes>, Error>
+```
+
+Get a value from the snapshot.
+
+<ParamField path="key" type="K: AsRef<[u8]> + Send" required>
+  The key to retrieve
+</ParamField>
+
+<ResponseField name="Result" type="Result<Option<Bytes>, Error>">
+  Returns `Some(Bytes)` if the key exists in the snapshot, `None` otherwise
+</ResponseField>
+
+```rust
+let snapshot = db.snapshot().await?;
+let value = snapshot.get(b"key").await?;
+```
+
+### get_with_options
+
+```rust
+pub async fn get_with_options<K: AsRef<[u8]> + Send>(
+    &self,
+    key: K,
+    options: &ReadOptions,
+) -> Result<Option<Bytes>, Error>
+```
+
+Get a value with custom read options.
+
+<ParamField path="key" type="K: AsRef<[u8]> + Send" required>
+  The key to retrieve
+</ParamField>
+
+<ParamField path="options" type="&ReadOptions" required>
+  Read options to customize the operation
+</ParamField>
+
+<ResponseField name="Result" type="Result<Option<Bytes>, Error>">
+  Returns the value if found
+</ResponseField>
+
+### get_key_value
+
+```rust
+pub async fn get_key_value<K: AsRef<[u8]> + Send>(
+    &self,
+    key: K,
+) -> Result<Option<KeyValue>, Error>
+```
+
+Get a key-value pair with metadata from the snapshot.
+
+<ParamField path="key" type="K: AsRef<[u8]> + Send" required>
+  The key to look up
+</ParamField>
+
+<ResponseField name="Result" type="Result<Option<KeyValue>, Error>">
+  Returns `Some(KeyValue)` with key, value, and metadata
+</ResponseField>
+
+### get_key_value_with_options
+
+```rust
+pub async fn get_key_value_with_options<K: AsRef<[u8]> + Send>(
+    &self,
+    key: K,
+    options: &ReadOptions,
+) -> Result<Option<KeyValue>, Error>
+```
+
+Get a key-value pair with custom read options.
+
+<ParamField path="key" type="K: AsRef<[u8]> + Send" required>
+  The key to look up
+</ParamField>
+
+<ParamField path="options" type="&ReadOptions" required>
+  Read options to use
+</ParamField>
+
+<ResponseField name="Result" type="Result<Option<KeyValue>, Error>">
+  Returns the key-value pair with metadata
+</ResponseField>
+
+## Scan Operations
+
+### scan
+
+```rust
+pub async fn scan<K, T>(&self, range: T) -> Result<DbIterator, Error>
+where
+    K: AsRef<[u8]> + Send,
+    T: RangeBounds<K> + Send,
+```
+
+Scan a range of keys in the snapshot.
+
+<ParamField path="range" type="T: RangeBounds<K>" required>
+  The range of keys to scan
+</ParamField>
+
+<ResponseField name="Result" type="Result<DbIterator, Error>">
+  Returns a `DbIterator` for iterating over the snapshot data
+</ResponseField>
+
+### scan_with_options
+
+```rust
+pub async fn scan_with_options<K, T>(
+    &self,
+    range: T,
+    options: &ScanOptions,
+) -> Result<DbIterator, Error>
+where
+    K: AsRef<[u8]> + Send,
+    T: RangeBounds<K> + Send,
+```
+
+Scan a range with custom options.
+
+<ParamField path="range" type="T: RangeBounds<K>" required>
+  The range to scan
+</ParamField>
+
+<ParamField path="options" type="&ScanOptions" required>
+  Scan options to use
+</ParamField>
+
+<ResponseField name="Result" type="Result<DbIterator, Error>">
+  Returns an iterator over the results
+</ResponseField>
+
+### scan_prefix
+
+```rust
+pub async fn scan_prefix<P>(&self, prefix: P) -> Result<DbIterator, Error>
+where
+    P: AsRef<[u8]> + Send,
+```
+
+Scan all keys with a common prefix in the snapshot.
+
+<ParamField path="prefix" type="P: AsRef<[u8]>" required>
+  The key prefix to scan
+</ParamField>
+
+<ResponseField name="Result" type="Result<DbIterator, Error>">
+  Returns an iterator over matching keys
+</ResponseField>
+
+### scan_prefix_with_options
+
+```rust
+pub async fn scan_prefix_with_options<P>(
+    &self,
+    prefix: P,
+    options: &ScanOptions,
+) -> Result<DbIterator, Error>
+where
+    P: AsRef<[u8]> + Send,
+```
+
+Scan a prefix with custom options.
+
+<ParamField path="prefix" type="P: AsRef<[u8]>" required>
+  The prefix to scan
+</ParamField>
+
+<ParamField path="options" type="&ScanOptions" required>
+  Scan options to use
+</ParamField>
+
+<ResponseField name="Result" type="Result<DbIterator, Error>">
+  Returns an iterator over the results
+</ResponseField>
+
+## Usage Examples
+
+### Basic Snapshot Usage
+
+```rust
+use slatedb::{Db, Error};
+use bytes::Bytes;
+
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    let db = Db::open("test_db", object_store).await?;
+    
+    // Write some data
+    db.put(b"key1", b"value1").await?;
+    let snapshot = db.snapshot().await?;
+    
+    // Snapshot sees the data
+    let value = snapshot.get(b"key1").await?;
+    assert_eq!(value, Some(Bytes::from("value1")));
+    
+    // Write more data to the database
+    db.put(b"key2", b"value2").await?;
+    
+    // Snapshot doesn't see the new data
+    assert_eq!(snapshot.get(b"key2").await?, None);
+    
+    // But the database does
+    assert_eq!(db.get(b"key2").await?, Some(Bytes::from("value2")));
+    
+    Ok(())
+}
+```
+
+### Point-in-Time Consistency
+
+```rust
+// Create initial state
+db.put(b"balance", b"1000").await?;
+db.put(b"account_name", b"Alice").await?;
+
+// Create snapshot
+let snapshot = db.snapshot().await?;
+
+// Continue making changes to the database
+db.put(b"balance", b"500").await?;
+db.put(b"last_transaction", b"withdrawal").await?;
+
+// Snapshot still sees the old state
+assert_eq!(
+    snapshot.get(b"balance").await?,
+    Some(Bytes::from("1000"))
+);
+assert_eq!(
+    snapshot.get(b"last_transaction").await?,
+    None
+);
+```
+
+### Scanning Snapshots
+
+```rust
+// Set up initial data
+for i in 1..=5 {
+    let key = format!("key{}", i);
+    let value = format!("value{}", i);
+    db.put(key.as_bytes(), value.as_bytes()).await?;
+}
+
+// Create snapshot
+let snapshot = db.snapshot().await?;
+
+// Add more data
+db.put(b"key6", b"value6").await?;
+db.put(b"key7", b"value7").await?;
+
+// Scan the snapshot - only sees keys 1-5
+let mut iter = snapshot.scan(..).await?;
+let mut count = 0;
+while let Some(_kv) = iter.next().await? {
+    count += 1;
+}
+assert_eq!(count, 5);
+
+// Scan the database - sees all keys 1-7
+let mut iter = db.scan(..).await?;
+let mut count = 0;
+while let Some(_kv) = iter.next().await? {
+    count += 1;
+}
+assert_eq!(count, 7);
+```
+
+### Multiple Snapshots
+
+```rust
+// Version 1
+db.put(b"key", b"version1").await?;
+let snapshot1 = db.snapshot().await?;
+
+// Version 2
+db.put(b"key", b"version2").await?;
+let snapshot2 = db.snapshot().await?;
+
+// Version 3
+db.put(b"key", b"version3").await?;
+let snapshot3 = db.snapshot().await?;
+
+// Each snapshot sees its respective version
+assert_eq!(
+    snapshot1.get(b"key").await?,
+    Some(Bytes::from("version1"))
+);
+assert_eq!(
+    snapshot2.get(b"key").await?,
+    Some(Bytes::from("version2"))
+);
+assert_eq!(
+    snapshot3.get(b"key").await?,
+    Some(Bytes::from("version3"))
+);
+```
+
+### Analytical Queries on Snapshots
+
+```rust
+// Create snapshot for analytical query
+let snapshot = db.snapshot().await?;
+
+// Perform analytics without blocking writes
+let mut iter = snapshot.scan_prefix(b"user:").await?;
+let mut total_users = 0;
+let mut premium_users = 0;
+
+while let Some(kv) = iter.next().await? {
+    total_users += 1;
+    if kv.value.starts_with(b"premium") {
+        premium_users += 1;
+    }
+}
+
+println!("Total users: {}", total_users);
+println!("Premium users: {}", premium_users);
+
+// Meanwhile, the database can continue processing writes
+db.put(b"user:new", b"standard").await?;
+```
+
+## Snapshot Lifecycle
+
+Snapshots are automatically cleaned up when dropped:
+
+```rust
+{
+    let snapshot = db.snapshot().await?;
+    // Use snapshot
+    snapshot.get(b"key").await?;
+} // Snapshot is dropped here and resources are released
+
+// Continue using database normally
+db.put(b"key", b"value").await?;
+```
+
+<Info>
+Snapshots are lightweight and do not copy data. They maintain a reference to the database state at the time of creation.
+</Info>
+
+<Warning>
+Holding snapshots for extended periods can prevent old data from being garbage collected, increasing storage usage.
+</Warning>

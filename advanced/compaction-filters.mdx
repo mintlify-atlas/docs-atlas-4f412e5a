@@ -1,0 +1,558 @@
+---
+title: Compaction Filters
+description: Custom entry filtering and transformation during compaction
+---
+
+<Warning>
+Compaction filters are gated behind the `compaction_filters` feature flag and may affect snapshot consistency. See [Limitations](#limitations) for details.
+</Warning>
+
+Compaction filters allow you to inspect, drop, convert to tombstone, or modify entries during compaction. This enables use cases like custom TTL logic, MVCC garbage collection, and schema migrations.
+
+## Overview
+
+Compaction filters integrate into SlateDB's compaction pipeline:
+
+```
+MergeIterator (combine sources)
+    ↓
+MergeOperatorIterator (resolve merge operands)
+    ↓  
+RetentionIterator (built-in TTL, snapshot retention)
+    ↓
+CompactionFilterIterator (user-provided filters) ← Your filter here
+    ↓
+SST Writer (output)
+```
+
+Each compaction job creates a fresh filter instance, providing isolated state and single-threaded execution.
+
+## Basic Usage
+
+### Enable Feature Flag
+
+Add to your `Cargo.toml`:
+
+```toml
+[dependencies]
+slatedb = { version = "...", features = ["compaction_filters"] }
+```
+
+### Implement CompactionFilter
+
+```rust
+use slatedb::{
+    CompactionFilter, CompactionFilterSupplier, CompactionJobContext,
+    CompactionFilterDecision, CompactionFilterError, RowEntry, ValueDeletable,
+};
+use async_trait::async_trait;
+use bytes::Bytes;
+
+/// Filter that converts entries with a specific prefix to tombstones
+struct PrefixDeletingFilter {
+    prefix: Bytes,
+    deleted_count: u64,
+}
+
+#[async_trait]
+impl CompactionFilter for PrefixDeletingFilter {
+    async fn filter(
+        &mut self,
+        entry: &RowEntry,
+    ) -> Result<CompactionFilterDecision, CompactionFilterError> {
+        if entry.key.starts_with(&self.prefix) {
+            self.deleted_count += 1;
+            // Use Tombstone to shadow older versions in lower levels
+            Ok(CompactionFilterDecision::Modify(ValueDeletable::Tombstone))
+        } else {
+            Ok(CompactionFilterDecision::Keep)
+        }
+    }
+
+    async fn on_compaction_end(&mut self) -> Result<(), CompactionFilterError> {
+        println!("Deleted {} entries with prefix {:?}", 
+                 self.deleted_count, self.prefix);
+        Ok(())
+    }
+}
+```
+
+### Implement CompactionFilterSupplier
+
+The supplier creates a new filter instance for each compaction job:
+
+```rust
+struct PrefixDeletingFilterSupplier {
+    prefix: Bytes,
+}
+
+#[async_trait]
+impl CompactionFilterSupplier for PrefixDeletingFilterSupplier {
+    async fn create_compaction_filter(
+        &self,
+        context: &CompactionJobContext,
+    ) -> Result<Box<dyn CompactionFilter>, CompactionFilterError> {
+        // Can use context to customize filter behavior
+        println!("Creating filter for SR {}", context.destination);
+        
+        Ok(Box::new(PrefixDeletingFilter {
+            prefix: self.prefix.clone(),
+            deleted_count: 0,
+        }))
+    }
+}
+```
+
+### Configure Database
+
+```rust
+use std::sync::Arc;
+
+let db = Db::builder("/mydb", object_store)
+    .with_compaction_filter_supplier(Arc::new(PrefixDeletingFilterSupplier {
+        prefix: Bytes::from_static(b"temp:"),
+    }))
+    .build()
+    .await?;
+```
+
+## Filter Decisions
+
+### Keep
+
+Pass the entry through unchanged:
+
+```rust
+Ok(CompactionFilterDecision::Keep)
+```
+
+### Drop
+
+Remove the entry entirely without leaving a tombstone:
+
+```rust
+if entry.key.starts_with(b"cache:") {
+    return Ok(CompactionFilterDecision::Drop);
+}
+```
+
+<Callout type="warning">
+  **Warning**: Dropping an entry removes it completely without a tombstone. This can cause older versions in lower levels to "resurrect" and become visible again. Only use `Drop` when you're certain no older versions exist or resurrection is acceptable.
+</Callout>
+
+**For merge operands**: Prefer `Drop` over `Modify(Tombstone)`. A tombstone would delete all previous merge operands for the key, while dropping just removes the current operand from the merge chain.
+
+### Modify
+
+Change the entry's value:
+
+```rust
+// Convert to tombstone
+if should_delete(entry) {
+    return Ok(CompactionFilterDecision::Modify(ValueDeletable::Tombstone));
+}
+
+// Update value
+if let Some(bytes) = entry.value.as_bytes() {
+    let new_value = transform(bytes);
+    return Ok(CompactionFilterDecision::Modify(
+        ValueDeletable::Value(Bytes::from(new_value))
+    ));
+}
+```
+
+**Behavior**:
+- `Modify(Tombstone)`: Converts entry to tombstone; `expire_ts` is cleared
+- `Modify(Value(bytes))`: Replaces value; `expire_ts` is preserved
+- `Modify(Merge(bytes))`: Replaces with merge operand; all metadata preserved
+
+Key, sequence number, and `create_ts` always remain unchanged.
+
+## CompactionJobContext
+
+The context provides information about the compaction job:
+
+```rust
+async fn create_compaction_filter(
+    &self,
+    context: &CompactionJobContext,
+) -> Result<Box<dyn CompactionFilter>, CompactionFilterError> {
+    // Destination sorted run ID
+    let sr_id = context.destination;
+    
+    // Whether this is the bottommost level (no older data below)
+    if context.is_dest_last_run {
+        // Safe to drop tombstones - no older versions to shadow
+    }
+    
+    // Logical compaction time (for time-based retention)
+    let compaction_time = context.compaction_clock_tick;
+    
+    // Minimum sequence protected by snapshots
+    if let Some(min_seq) = context.retention_min_seq {
+        // Entries with seq >= min_seq are protected by active snapshots
+        // Modifying/dropping them may break snapshot consistency
+    }
+    
+    Ok(Box::new(MyFilter { /* ... */ }))
+}
+```
+
+## Advanced Examples
+
+### Custom TTL
+
+Implement application-specific expiration logic:
+
+```rust
+struct CustomTtlFilter {
+    current_time_ms: i64,
+}
+
+#[async_trait]
+impl CompactionFilter for CustomTtlFilter {
+    async fn filter(
+        &mut self,
+        entry: &RowEntry,
+    ) -> Result<CompactionFilterDecision, CompactionFilterError> {
+        // Custom logic: keys starting with "session:" expire after 1 hour
+        if entry.key.starts_with(b"session:") {
+            if let Some(create_ts) = entry.create_ts {
+                let age_ms = self.current_time_ms - create_ts;
+                if age_ms > 3_600_000 {  // 1 hour
+                    return Ok(CompactionFilterDecision::Drop);
+                }
+            }
+        }
+        
+        Ok(CompactionFilterDecision::Keep)
+    }
+
+    async fn on_compaction_end(&mut self) -> Result<(), CompactionFilterError> {
+        Ok(())
+    }
+}
+
+struct CustomTtlFilterSupplier;
+
+#[async_trait]
+impl CompactionFilterSupplier for CustomTtlFilterSupplier {
+    async fn create_compaction_filter(
+        &self,
+        context: &CompactionJobContext,
+    ) -> Result<Box<dyn CompactionFilter>, CompactionFilterError> {
+        Ok(Box::new(CustomTtlFilter {
+            current_time_ms: context.compaction_clock_tick,
+        }))
+    }
+}
+```
+
+### Schema Migration
+
+Transform data format during compaction:
+
+```rust
+use serde::{Deserialize, Serialize};
+
+#[derive(Deserialize)]
+struct OldSchema {
+    name: String,
+    value: i32,
+}
+
+#[derive(Serialize)]
+struct NewSchema {
+    name: String,
+    value: i64,  // Changed from i32 to i64
+    timestamp: i64,  // New field
+}
+
+struct SchemaMigrationFilter {
+    migrated_count: u64,
+}
+
+#[async_trait]
+impl CompactionFilter for SchemaMigrationFilter {
+    async fn filter(
+        &mut self,
+        entry: &RowEntry,
+    ) -> Result<CompactionFilterDecision, CompactionFilterError> {
+        if let ValueDeletable::Value(bytes) = &entry.value {
+            // Try to deserialize as old schema
+            if let Ok(old) = serde_json::from_slice::<OldSchema>(bytes) {
+                // Migrate to new schema
+                let new = NewSchema {
+                    name: old.name,
+                    value: old.value as i64,
+                    timestamp: entry.create_ts.unwrap_or(0),
+                };
+                
+                let new_bytes = serde_json::to_vec(&new)
+                    .map_err(|e| CompactionFilterError::FilterError(Box::new(e)))?;
+                
+                self.migrated_count += 1;
+                return Ok(CompactionFilterDecision::Modify(
+                    ValueDeletable::Value(Bytes::from(new_bytes))
+                ));
+            }
+        }
+        
+        Ok(CompactionFilterDecision::Keep)
+    }
+
+    async fn on_compaction_end(&mut self) -> Result<(), CompactionFilterError> {
+        println!("Migrated {} entries to new schema", self.migrated_count);
+        Ok(())
+    }
+}
+```
+
+### MVCC Garbage Collection
+
+Keep only recent versions of multi-versioned data:
+
+```rust
+struct MvccGcFilter {
+    versions_to_keep: usize,
+    key_versions: std::collections::HashMap<Bytes, Vec<u64>>,
+}
+
+#[async_trait]
+impl CompactionFilter for MvccGcFilter {
+    async fn filter(
+        &mut self,
+        entry: &RowEntry,
+    ) -> Result<CompactionFilterDecision, CompactionFilterError> {
+        // Track versions for each key
+        let versions = self.key_versions
+            .entry(entry.key.clone())
+            .or_insert_with(Vec::new);
+        versions.push(entry.seq);
+        
+        // Keep only the N most recent versions
+        if versions.len() > self.versions_to_keep {
+            // This is an old version, drop it
+            Ok(CompactionFilterDecision::Drop)
+        } else {
+            Ok(CompactionFilterDecision::Keep)
+        }
+    }
+
+    async fn on_compaction_end(&mut self) -> Result<(), CompactionFilterError> {
+        Ok(())
+    }
+}
+```
+
+<Callout type="info">
+  **Note**: The above MVCC example is simplified. In practice, you'd need more sophisticated logic to handle entries across multiple compaction runs and avoid resurrection issues.
+</Callout>
+
+### External Service Lookup
+
+Filter based on external data (use with caution - see performance considerations):
+
+```rust
+use reqwest::Client;
+
+struct ExternalFilter {
+    client: Client,
+    api_url: String,
+    // Cache results to avoid repeated lookups
+    cache: std::collections::HashMap<Bytes, bool>,
+}
+
+#[async_trait]
+impl CompactionFilter for ExternalFilter {
+    async fn filter(
+        &mut self,
+        entry: &RowEntry,
+    ) -> Result<CompactionFilterDecision, CompactionFilterError> {
+        // Check cache first
+        if let Some(&should_keep) = self.cache.get(&entry.key) {
+            return Ok(if should_keep {
+                CompactionFilterDecision::Keep
+            } else {
+                CompactionFilterDecision::Drop
+            });
+        }
+        
+        // Query external service
+        let response = self.client
+            .get(&format!("{}/check/{}", self.api_url, 
+                          String::from_utf8_lossy(&entry.key)))
+            .send()
+            .await
+            .map_err(|e| CompactionFilterError::FilterError(Box::new(e)))?;
+        
+        let should_keep = response.status().is_success();
+        self.cache.insert(entry.key.clone(), should_keep);
+        
+        Ok(if should_keep {
+            CompactionFilterDecision::Keep
+        } else {
+            CompactionFilterDecision::Drop
+        })
+    }
+
+    async fn on_compaction_end(&mut self) -> Result<(), CompactionFilterError> {
+        println!("Processed {} unique keys", self.cache.len());
+        Ok(())
+    }
+}
+```
+
+## Error Handling
+
+Filter errors abort the compaction job:
+
+```rust
+async fn filter(
+    &mut self,
+    entry: &RowEntry,
+) -> Result<CompactionFilterDecision, CompactionFilterError> {
+    match self.validate(entry) {
+        Ok(decision) => Ok(decision),
+        Err(e) => {
+            // Log error details before aborting
+            eprintln!("Filter error for key {:?}: {}", entry.key, e);
+            Err(CompactionFilterError::FilterError(Box::new(e)))
+        }
+    }
+}
+```
+
+**Error Types**:
+- `CreationError`: Failed in `create_compaction_filter()` - aborts before processing entries
+- `FilterError`: Failed in `filter()` - aborts mid-compaction
+- `CompactionEndError`: Failed in `on_compaction_end()` - aborts after processing all entries
+
+All error types preserve the error chain for debugging.
+
+## Performance Considerations
+
+### Filter Method Performance
+
+The `filter()` method is called **for every entry** during compaction:
+
+```rust
+// BAD: I/O per entry (very slow)
+async fn filter(&mut self, entry: &RowEntry) 
+    -> Result<CompactionFilterDecision, CompactionFilterError> 
+{
+    let config = load_config_from_file().await?;  // ❌ Don't do this!
+    // ...
+}
+
+// GOOD: Load once, use many times
+struct MyFilter {
+    config: Config,  // Loaded in create_compaction_filter()
+}
+
+async fn filter(&mut self, entry: &RowEntry) 
+    -> Result<CompactionFilterDecision, CompactionFilterError> 
+{
+    // Use pre-loaded config ✓
+    if self.config.should_delete(&entry.key) {
+        return Ok(CompactionFilterDecision::Drop);
+    }
+    Ok(CompactionFilterDecision::Keep)
+}
+```
+
+**Best Practices**:
+- Load configuration in `create_compaction_filter()`, not `filter()`
+- Cache external lookups (use HashMap or LRU cache)
+- Prefer synchronous logic over async I/O in `filter()`
+- Batch operations in `on_compaction_end()` if possible
+
+### CPU-Intensive Filters
+
+For expensive computations, use a dedicated compaction runtime:
+
+```rust
+let compaction_runtime = tokio::runtime::Builder::new_multi_thread()
+    .worker_threads(4)
+    .thread_name("compaction")
+    .build()?;
+
+let db = Db::builder("/mydb", object_store)
+    .with_compaction_runtime(compaction_runtime.handle().clone())
+    .with_compaction_filter_supplier(Arc::new(MyCpuIntensiveFilter))
+    .build()
+    .await?;
+```
+
+This prevents filter computation from blocking your main application runtime.
+
+## Limitations
+
+### Feature Flag and Snapshot Consistency
+
+<Callout type="warning">
+  Compaction filters are behind the `compaction_filters` feature flag because they may affect snapshot consistency. When filters are enabled:
+  
+  - Filters may modify or drop entries that snapshots expect to see
+  - Snapshot reads may return unexpected results if the filter altered data
+  - Users who need consistent snapshots should carefully consider their filter logic
+</Callout>
+
+The `CompactionJobContext` includes `retention_min_seq` to help protect snapshot data:
+
+```rust
+async fn filter(
+    &mut self,
+    entry: &RowEntry,
+) -> Result<CompactionFilterDecision, CompactionFilterError> {
+    // Check if entry is protected by snapshot
+    if let Some(min_seq) = self.context.retention_min_seq {
+        if entry.seq >= min_seq {
+            // This entry is protected by an active snapshot
+            // Modifying or dropping it may break snapshot consistency
+            return Ok(CompactionFilterDecision::Keep);
+        }
+    }
+    
+    // Safe to filter entries below snapshot boundary
+    // ...
+}
+```
+
+**Why the feature flag?**
+
+Protecting snapshot data from arbitrary user filters adds significant complexity. RocksDB faced the same challenge and [removed snapshot protection in v6.0](https://github.com/facebook/rocksdb/wiki/Compaction-Filter), noting "the feature has a bug which can't be easily fixed."
+
+SlateDB starts with a simple implementation behind a feature flag. Users who enable this feature understand the trade-offs and can implement snapshot protection in their filter logic if needed.
+
+### Other Limitations
+
+- **Entry-level API**: Filters process one entry at a time, not batches of versions
+- **No key modification**: Can only modify values, not keys
+- **No entry emission**: Cannot create new entries, only keep/drop/modify existing ones
+- **Single-threaded**: Each filter runs on the compactor thread (though multiple compactions can run concurrently)
+
+## Standalone Compactor
+
+When running a standalone compactor, configure the same filter:
+
+```rust
+use slatedb::compactor::CompactorBuilder;
+
+let compactor = CompactorBuilder::new("/mydb", object_store)
+    .with_compaction_filter_supplier(Arc::new(MyFilterSupplier))
+    .build()
+    .await?;
+
+compactor.run().await?;
+```
+
+<Callout type="warning">
+  **Important**: The standalone compactor must use the **same** `CompactionFilterSupplier` as the database writer. Mismatched filters can lead to inconsistent behavior.
+</Callout>
+
+## Related Documentation
+
+- [Compaction](/advanced/compaction) - Understanding the compaction pipeline
+- [Write-Ahead Log](/advanced/wal) - Entry lifecycle before compaction
+- [Garbage Collection](/advanced/garbage-collection) - Cleaning up filtered data

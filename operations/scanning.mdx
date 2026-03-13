@@ -1,0 +1,352 @@
+---
+title: Scanning
+description: Iterate over ranges of keys efficiently in SlateDB
+---
+
+SlateDB provides powerful scanning capabilities to iterate over ranges of keys. Scans return an asynchronous iterator that efficiently streams results from memory and object storage.
+
+## Basic Scanning
+
+### Scan a Range
+
+Iterate over a range of keys:
+
+```rust
+use slatedb::Db;
+
+let mut iter = db.scan(b"user:a"..b"user:z").await?;
+
+while let Some(kv) = iter.next().await? {
+    println!("Key: {:?}, Value: {:?}", kv.key, kv.value);
+}
+```
+
+### Scan with Inclusive Bounds
+
+Use inclusive range syntax:
+
+```rust
+// Scan from "a" to "z" (inclusive)
+let mut iter = db.scan(b"a"..=b"z").await?;
+```
+
+### Scan from a Starting Point
+
+Scan from a key to the end:
+
+```rust
+// Scan from "user:m" onwards
+let mut iter = db.scan(b"user:m"..).await?;
+```
+
+### Scan All Keys
+
+Scan the entire database:
+
+```rust
+// Scan all keys
+let mut iter = db.scan(..).await?;
+```
+
+## Prefix Scanning
+
+Scan all keys with a common prefix:
+
+```rust
+// Find all user keys
+let mut iter = db.scan_prefix(b"user:").await?;
+
+while let Some(kv) = iter.next().await? {
+    println!("User key: {:?}", kv.key);
+}
+```
+
+<Note>
+  Prefix scans are more convenient than calculating range bounds manually and ensure you don't miss keys.
+</Note>
+
+## Scan Options
+
+Customize scan behavior with `ScanOptions`:
+
+```rust
+use slatedb::config::{ScanOptions, DurabilityLevel};
+
+let options = ScanOptions {
+    durability_filter: DurabilityLevel::Remote,
+    cache_blocks: false,
+    ..ScanOptions::default()
+};
+
+let mut iter = db.scan_with_options(b"key:a"..b"key:z", &options).await?;
+```
+
+### Available Options
+
+- **durability_filter**: Control which data to scan
+  - `DurabilityLevel::Memory` - Include data still in memory
+  - `DurabilityLevel::Remote` - Only scan persisted data
+  
+- **cache_blocks**: Whether to cache data blocks during the scan
+  - `true` - Cache blocks (better for repeated scans)
+  - `false` - Don't cache (better for one-time scans)
+
+## Iterator Operations
+
+### Seeking Ahead
+
+Skip ahead to a specific key:
+
+```rust
+let mut iter = db.scan(b"a"..).await?;
+
+// Read first few items
+let kv1 = iter.next().await?;
+let kv2 = iter.next().await?;
+
+// Skip ahead to "m"
+iter.seek(b"m").await?;
+
+let kv = iter.next().await?;  // Returns first key >= "m"
+```
+
+<Warning>
+  You can only seek forward, not backward. Seeking to a key before the current position returns an error.
+</Warning>
+
+### Handling the Iterator
+
+The iterator returns `Result<Option<KeyValue>>`:
+
+```rust
+let mut iter = db.scan(b"key:"..).await?;
+
+loop {
+    match iter.next().await {
+        Ok(Some(kv)) => {
+            // Process key-value
+            println!("{:?} = {:?}", kv.key, kv.value);
+        }
+        Ok(None) => {
+            // End of iteration
+            break;
+        }
+        Err(e) => {
+            // Handle error
+            eprintln!("Scan error: {}", e);
+            break;
+        }
+    }
+}
+```
+
+## Scanning in Transactions
+
+Scans within transactions see a consistent snapshot:
+
+```rust
+use slatedb::IsolationLevel;
+
+let txn = db.begin(IsolationLevel::Snapshot).await?;
+
+// This scan sees the database state at transaction start
+let mut iter = txn.scan(b"item:"..).await?;
+
+while let Some(kv) = iter.next().await? {
+    println!("Item: {:?}", kv.key);
+}
+
+txn.commit().await?;
+```
+
+<Note>
+  Scans in transactions automatically track read ranges for conflict detection in Serializable Snapshot Isolation.
+</Note>
+
+## Scanning Snapshots
+
+Scan a specific point-in-time snapshot:
+
+```rust
+let snapshot = db.snapshot().await?;
+
+// Scan the snapshot
+let mut iter = snapshot.scan(b"key:"..).await?;
+
+while let Some(kv) = iter.next().await? {
+    println!("{:?}", kv.key);
+}
+```
+
+## Complete Examples
+
+### Example 1: Count Keys by Prefix
+
+```rust
+use slatedb::{Db, Error};
+
+async fn count_by_prefix(db: &Db, prefix: &[u8]) -> Result<usize, Error> {
+    let mut count = 0;
+    let mut iter = db.scan_prefix(prefix).await?;
+    
+    while let Some(_) = iter.next().await? {
+        count += 1;
+    }
+    
+    Ok(count)
+}
+
+// Usage
+let user_count = count_by_prefix(&db, b"user:").await?;
+println!("Total users: {}", user_count);
+```
+
+### Example 2: Batch Processing with Seek
+
+```rust
+use slatedb::{Db, Error};
+use bytes::Bytes;
+
+async fn process_in_batches(
+    db: &Db,
+    start_key: &[u8],
+    batch_size: usize,
+) -> Result<(), Error> {
+    let mut iter = db.scan(start_key..).await?;
+    let mut batch = Vec::new();
+    let mut last_key: Option<Bytes> = None;
+    
+    while let Some(kv) = iter.next().await? {
+        batch.push(kv.clone());
+        last_key = Some(kv.key);
+        
+        if batch.len() >= batch_size {
+            // Process batch
+            process_batch(&batch).await?;
+            batch.clear();
+        }
+    }
+    
+    // Process remaining items
+    if !batch.is_empty() {
+        process_batch(&batch).await?;
+    }
+    
+    Ok(())
+}
+
+async fn process_batch(batch: &[slatedb::types::KeyValue]) -> Result<(), Error> {
+    println!("Processing {} items", batch.len());
+    // Your processing logic here
+    Ok(())
+}
+```
+
+### Example 3: Collecting Results
+
+```rust
+use slatedb::{Db, Error};
+use bytes::Bytes;
+
+async fn find_all_matches(
+    db: &Db,
+    prefix: &[u8],
+    predicate: impl Fn(&[u8]) -> bool,
+) -> Result<Vec<Bytes>, Error> {
+    let mut results = Vec::new();
+    let mut iter = db.scan_prefix(prefix).await?;
+    
+    while let Some(kv) = iter.next().await? {
+        if predicate(&kv.value) {
+            results.push(kv.value);
+        }
+    }
+    
+    Ok(results)
+}
+
+// Usage: Find all active users
+let active_users = find_all_matches(
+    &db,
+    b"user:",
+    |value| value.starts_with(b"active:"),
+).await?;
+```
+
+### Example 4: Range Scan with Filtering
+
+```rust
+use slatedb::{Db, Error};
+
+async fn scan_range_filtered(
+    db: &Db,
+    start: &[u8],
+    end: &[u8],
+) -> Result<(), Error> {
+    let mut iter = db.scan(start..end).await?;
+    
+    while let Some(kv) = iter.next().await? {
+        // Only process keys matching certain criteria
+        if kv.key.len() > 10 {
+            println!("Long key: {:?}", kv.key);
+        }
+    }
+    
+    Ok(())
+}
+```
+
+## Performance Considerations
+
+<Steps>
+  <Step title="Use Prefix Scans When Possible">
+    Prefix scans are optimized and more convenient than range scans for common prefixes.
+  </Step>
+  
+  <Step title="Disable Block Caching for Large Scans">
+    Set `cache_blocks: false` for one-time large scans to avoid evicting hot data.
+  </Step>
+  
+  <Step title="Process in Batches">
+    For large scans, process results in batches to control memory usage.
+  </Step>
+  
+  <Step title="Use Seek for Sparse Access">
+    If you only need specific keys in a range, use `seek()` to skip ahead efficiently.
+  </Step>
+</Steps>
+
+## Iterator Errors
+
+Scans can fail for various reasons:
+
+```rust
+let mut iter = db.scan(..).await?;
+
+while let Some(kv) = iter.next().await? {
+    // Process normally
+}
+
+// After an error, the iterator is invalidated
+match iter.next().await {
+    Err(e) if e.to_string().contains("invalidated") => {
+        println!("Iterator was invalidated due to previous error");
+    }
+    _ => {}
+}
+```
+
+<Warning>
+  Once an iterator returns an error, it becomes invalidated and all subsequent calls will return the same error.
+</Warning>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Basic Operations" icon="database" href="/operations/basic-operations">
+    Learn about get, put, and delete operations
+  </Card>
+  <Card title="Snapshots" icon="camera" href="/operations/snapshots">
+    Create consistent point-in-time views
+  </Card>
+</CardGroup>

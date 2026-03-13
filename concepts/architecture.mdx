@@ -1,0 +1,322 @@
+---
+title: Architecture
+description: Understand SlateDB's cloud-native LSM-tree architecture built on object storage
+---
+
+SlateDB is an embedded storage engine built as a log-structured merge-tree (LSM-tree) on object storage. Unlike traditional LSM-tree implementations that use local disk, SlateDB leverages cloud object storage (S3, GCS, Azure Blob Storage, MinIO, etc.) as its primary storage layer.
+
+## High-Level Architecture
+
+SlateDB's architecture consists of several key components working together:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    SlateDB Client Process                    │
+│                                                               │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐      │
+│  │   MemTable   │  │  Immutable   │  │   L0 SSTs    │      │
+│  │   (Active)   │  │  MemTables   │  │   (Memory)   │      │
+│  └──────────────┘  └──────────────┘  └──────────────┘      │
+│         │                  │                   │              │
+│         └──────────────────┴───────────────────┘              │
+│                            │                                  │
+│                    ┌───────▼────────┐                        │
+│                    │  WAL Buffer    │                        │
+│                    │   Manager      │                        │
+│                    └───────┬────────┘                        │
+│                            │                                  │
+│  ┌─────────────────────────┴────────────────────────┐       │
+│  │           TableStore & ObjectStore               │       │
+│  │         (Block Cache, Filter Cache)              │       │
+│  └──────────────────────────────────────────────────┘       │
+└───────────────────────────┬─────────────────────────────────┘
+                            │
+                            ▼
+         ┌──────────────────────────────────────┐
+         │      Object Storage (S3, GCS...)     │
+         │                                       │
+         │  /manifest/  - Manifest files        │
+         │  /wal/       - WAL SSTs              │
+         │  /compacted/ - Compacted L0+ SSTs    │
+         └──────────────────────────────────────┘
+```
+
+## Core Components
+
+### Write Path Components
+
+#### MemTable
+
+The **active MemTable** is the primary write buffer where all `put()` and `delete()` operations first land. It's implemented using a concurrent skip list (`crossbeam_skiplist::SkipMap`) that maintains keys in sorted order with sequence numbers.
+
+Key characteristics:
+- In-memory sorted structure
+- Thread-safe for concurrent writes
+- Stores keys with monotonically increasing sequence numbers
+- Tracked by size to determine when to freeze
+
+See: `slatedb/src/mem_table.rs:91-365`
+
+#### Immutable MemTables
+
+When the active MemTable reaches the configured size threshold (`l0_sst_size_bytes`), it's frozen and moved to the **immutable MemTable queue**. These frozen tables are asynchronously flushed to object storage as L0 SSTs.
+
+See: `slatedb/src/mem_table.rs:149-246`
+
+#### WAL Buffer Manager
+
+The **WAL Buffer Manager** (`WalBufferManager`) coordinates writing the write-ahead log to object storage. It batches writes from multiple MemTable operations and flushes them as WAL SSTs at regular intervals or when the buffer fills.
+
+Key responsibilities:
+- Batch writes for efficiency
+- Manage flush intervals
+- Track durability watermarks
+- Coordinate with MemTable flusher
+
+See: `slatedb/src/wal_buffer.rs`
+
+### Read Path Components
+
+#### Reader
+
+The **Reader** component orchestrates point lookups and range scans across all storage layers. It searches in order:
+
+1. Active MemTable
+2. Immutable MemTables (newest to oldest)
+3. WAL SSTs (if not yet compacted to L0)
+4. L0 SSTs
+5. Compacted sorted runs (L1+)
+
+The search terminates at the first location where the key is found.
+
+See: `slatedb/src/db.rs:192-228`
+
+#### TableStore
+
+The **TableStore** manages all interactions with SST files in object storage. It provides:
+
+- Reading and writing SST files
+- Block-level access to SST data
+- Integration with caching layers
+- Index and filter management
+
+See: `slatedb/src/tablestore.rs:31-103`
+
+#### Caching
+
+SlateDB employs multi-tier caching to minimize object storage reads:
+
+- **Block Cache**: In-memory cache of 4KB data blocks from SSTs
+- **Index Cache**: Cached SST index blocks for fast key location
+- **Filter Cache**: Cached bloom filters to avoid unnecessary SST reads
+- **Disk Cache** (optional): Local disk cache for frequently accessed blocks
+
+See: `slatedb/src/db_cache.rs`
+
+### Metadata Management
+
+#### Manifest
+
+The **Manifest** is the source of truth for database state. It's stored in object storage and contains:
+
+- List of L0 SSTs
+- Sorted runs and their constituent SSTs
+- Writer epoch for fencing
+- Last compacted WAL ID
+- Sequence number watermarks
+
+The manifest is updated using compare-and-swap (CAS) operations to ensure consistency across multiple processes. Each update creates a new manifest file with an incrementing sequence number.
+
+See: `slatedb/src/manifest/`
+
+**Manifest Update Protocol:**
+
+```
+1. Read current manifest
+2. Prepare updated manifest state
+3. Write new manifest file: manifest/{seq+1}.manifest
+4. Use CAS or two-phase commit to make it current
+5. Old manifests are garbage collected later
+```
+
+See RFC: `rfcs/0001-manifest.md`
+
+### Background Processes
+
+#### Compactor
+
+The **Compactor** orchestrates the compaction of SSTs to reduce read and space amplification. It runs as a separate task and can even run as a separate process from the writer.
+
+Compaction tiers:
+- **WAL → L0**: Writer process compacts MemTables directly to L0
+- **L0 → L1+**: Compactor merges L0 SSTs into sorted runs
+- **SR → SR**: Compactor merges multiple sorted runs
+
+The compactor uses a **size-tiered compaction strategy** by default, where sorted runs of similar size are compacted together.
+
+See: `slatedb/src/compactor.rs:230-270`
+See RFC: `rfcs/0002-compaction.md`
+
+#### Garbage Collector
+
+The **Garbage Collector** removes obsolete files from object storage:
+
+- Old manifest files
+- Compacted SSTs that are no longer referenced
+- WAL SSTs that have been compacted to L0
+- Temporary files from failed operations
+
+It ensures that no active readers or compactions are using a file before deletion.
+
+See: `slatedb/src/garbage_collector/`
+
+## Process Architecture
+
+SlateDB supports flexible deployment models:
+
+### Single Process (Embedded)
+
+```
+┌────────────────────────────┐
+│   Application Process       │
+│  ┌──────────────────────┐  │
+│  │      SlateDB         │  │
+│  │  • Writer            │  │
+│  │  • Reader            │  │
+│  │  • Compactor         │  │
+│  │  • GC                │  │
+│  └──────────────────────┘  │
+└──────────┬─────────────────┘
+           │
+           ▼
+    Object Storage
+```
+
+### Distributed (Writer + Compactor)
+
+```
+┌─────────────────┐         ┌─────────────────┐
+│  Writer Process │         │ Compactor Process│
+│  • MemTable     │         │ • L0→L1+        │
+│  • WAL          │         │ • SR→SR         │
+│  • Readers      │         │                 │
+└────────┬────────┘         └────────┬────────┘
+         │                           │
+         └───────────┬───────────────┘
+                     ▼
+            Object Storage
+             • manifest/
+             • wal/
+             • compacted/
+```
+
+In distributed mode:
+- **Single writer** owns the write path and flushes to L0
+- **Single compactor** handles L0+ compaction
+- **Multiple readers** can read independently
+- Writer and compactor coordinate via manifest CAS
+
+## Write Flow
+
+A complete write operation follows this path:
+
+1. **Application calls `db.put(key, value)`**
+2. **Write to MemTable**: Key-value inserted with next sequence number
+3. **Write to WAL Buffer**: Buffered for batch flush
+4. **WAL Flush** (async): Buffer flushed to object storage as WAL SST
+5. **MemTable Freeze** (when full): Moved to immutable queue
+6. **L0 Flush**: Immutable MemTable written as L0 SST
+7. **Manifest Update**: New L0 SST recorded in manifest
+8. **Durability Achieved**: Write is now durable and visible to readers
+
+See: `slatedb/src/db.rs:275-307`
+
+## Read Flow
+
+A point lookup (`get()`) follows this search path:
+
+1. **Search Active MemTable**: Check in-memory writes first
+2. **Search Immutable MemTables**: Check frozen tables
+3. **Search WAL SSTs**: Check unflushed WAL (if any)
+4. **Search L0 SSTs**: Check recently compacted data
+5. **Search Sorted Runs**: Binary search through index, then read block
+6. **Return Result**: First match wins (newest version)
+
+Optimizations:
+- **Bloom filters** eliminate most negative lookups
+- **Block cache** avoids repeated object storage reads
+- **Index cache** speeds up key location
+- **Merge iterator** for range scans across layers
+
+See: `slatedb/src/db.rs:192-228`
+
+## Storage Layout
+
+SlateDB organizes files in object storage as:
+
+```
+/{db_path}/
+├── manifest/
+│   ├── 00000000000000000001.manifest
+│   ├── 00000000000000000002.manifest
+│   └── 00000000000000000003.manifest
+├── wal/
+│   ├── 00000000000000000001.sst
+│   ├── 00000000000000000002.sst
+│   └── 00000000000000000003.sst
+└── compacted/
+    ├── 01ARZ3NDEKTSV4RRFFQ69G5FAV.sst
+    ├── 01BX5ZZKBKACTAV9WEVGEMMVRZ.sst
+    └── 01C4QXZZXXYY9BCCMQWWZ4ZGQQ.sst
+```
+
+- **Manifest files**: Named with 20-digit zero-padded sequence numbers
+- **WAL SSTs**: Named with 20-digit zero-padded sequential IDs
+- **Compacted SSTs**: Named with ULIDs (sortable, time-based UUIDs)
+
+See: `slatedb/src/paths.rs`
+
+## Concurrency & Fencing
+
+SlateDB uses several mechanisms to ensure correctness:
+
+### Write Fencing
+
+Only one writer may write to a SlateDB instance at a time. The **writer epoch** in the manifest ensures this:
+
+1. Writer loads manifest and increments epoch
+2. Writer updates manifest with new epoch via CAS
+3. If CAS fails, another writer has taken over
+4. Zombie writer detects epoch change and halts
+
+See RFC: `rfcs/0001-manifest.md:140-160`
+
+### SST Immutability
+
+SSTs are written once and never modified. This enables:
+- Lock-free concurrent reads
+- Safe caching
+- Simple garbage collection
+
+### Manifest CAS
+
+All manifest updates use compare-and-swap to prevent concurrent modifications. This works on:
+- Cloud storage with native CAS (GCS, Azure)
+- S3 with two-phase commit protocol using DynamoDB
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="LSM-Tree Design" icon="layer-group" href="/concepts/lsm-tree">
+    Deep dive into SlateDB's LSM-tree implementation
+  </Card>
+  <Card title="Object Storage" icon="cloud" href="/concepts/object-storage">
+    Learn how SlateDB leverages object storage
+  </Card>
+  <Card title="Durability" icon="shield-check" href="/concepts/durability">
+    Understand SlateDB's durability guarantees
+  </Card>
+  <Card title="Compaction" icon="compress" href="/advanced/compaction">
+    Explore compaction strategies and algorithms
+  </Card>
+</CardGroup>

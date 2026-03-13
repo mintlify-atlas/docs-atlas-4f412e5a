@@ -1,0 +1,346 @@
+---
+title: Compaction
+description: Configure SlateDB's compaction behavior and scheduling
+---
+
+Compaction is the process of merging sorted runs to reduce space amplification (by removing old versions and tombstones) and read amplification (by reducing the number of runs to search). SlateDB's compaction system is highly configurable to match your workload requirements.
+
+## Overview
+
+Compaction in SlateDB consists of:
+
+1. **Scheduler**: Decides which sorted runs to compact together
+2. **Executor**: Performs the actual compaction work
+3. **Orchestrator**: Coordinates scheduling and execution
+
+## CompactorOptions
+
+The main compaction configuration is specified through `CompactorOptions`:
+
+```rust
+use slatedb::config::{Settings, CompactorOptions};
+use std::time::Duration;
+use std::collections::HashMap;
+
+let mut settings = Settings::default();
+settings.compactor_options = Some(CompactorOptions {
+    poll_interval: Duration::from_secs(5),
+    manifest_update_timeout: Duration::from_secs(300),
+    max_sst_size: 256 * 1024 * 1024,
+    max_concurrent_compactions: 4,
+    scheduler_options: HashMap::new(),
+});
+```
+
+### Basic Configuration
+
+<ParamField path="poll_interval" type="Duration" default="5s">
+  The interval at which the compactor checks for new manifest updates and decides if a compaction should be scheduled.
+
+  ```rust
+  compactor_options.poll_interval = Duration::from_secs(5);
+  ```
+
+  **Considerations:**
+  - Shorter intervals mean faster response to new data but more CPU overhead
+  - Longer intervals reduce overhead but delay compaction
+</ParamField>
+
+<ParamField path="manifest_update_timeout" type="Duration" default="300s">
+  Timeout to limit how long manifest updates are retried before giving up.
+
+  ```rust
+  compactor_options.manifest_update_timeout = Duration::from_secs(300);
+  ```
+</ParamField>
+
+<ParamField path="max_sst_size" type="usize" default="268435456 (256 MiB)">
+  A compacted SSTable's maximum size in bytes. If more data needs to be written during compaction, a new SSTable will be created when this size is exceeded.
+
+  ```rust
+  compactor_options.max_sst_size = 256 * 1024 * 1024; // 256 MiB
+  ```
+
+  **Considerations:**
+  - Larger SSTs reduce the number of files but increase memory usage during reads
+  - Smaller SSTs provide better read granularity but increase metadata overhead
+  - Recommended range: 128 MiB to 512 MiB
+</ParamField>
+
+<ParamField path="max_concurrent_compactions" type="usize" default="4">
+  The maximum number of concurrent compactions to execute at once.
+
+  ```rust
+  compactor_options.max_concurrent_compactions = 4;
+  ```
+
+  **Considerations:**
+  - More concurrent compactions increase throughput but use more CPU and memory
+  - Set based on available CPU cores and memory
+  - Typical range: 2-8 for most workloads
+</ParamField>
+
+## Size-Tiered Compaction Scheduler
+
+SlateDB currently uses a size-tiered compaction strategy. The scheduler is configured through the `scheduler_options` HashMap:
+
+```rust
+use std::collections::HashMap;
+
+let mut scheduler_options = HashMap::new();
+scheduler_options.insert("min_compaction_sources".to_string(), "4".to_string());
+scheduler_options.insert("max_compaction_sources".to_string(), "8".to_string());
+scheduler_options.insert("include_size_threshold".to_string(), "4.0".to_string());
+
+compactor_options.scheduler_options = scheduler_options;
+```
+
+### Scheduler Configuration
+
+<ParamField path="scheduler_options.min_compaction_sources" type="usize" default="4">
+  The minimum number of sources (L0 SSTs or sorted runs) to include in a single compaction.
+
+  ```rust
+  scheduler_options.insert("min_compaction_sources".to_string(), "4".to_string());
+  ```
+
+  **Considerations:**
+  - Lower values trigger compaction more frequently with less write amplification reduction
+  - Higher values reduce compaction frequency but may increase space amplification temporarily
+</ParamField>
+
+<ParamField path="scheduler_options.max_compaction_sources" type="usize" default="8">
+  The maximum number of sources to include in a single compaction.
+
+  ```rust
+  scheduler_options.insert("max_compaction_sources".to_string(), "8".to_string());
+  ```
+
+  **Considerations:**
+  - Higher values increase write amplification reduction per compaction
+  - Lower values reduce individual compaction duration
+  - Should be >= `min_compaction_sources`
+</ParamField>
+
+<ParamField path="scheduler_options.include_size_threshold" type="f32" default="4.0">
+  The size ratio threshold for including a sorted run in a compaction. A sorted run S will be added to compaction C if S's size is less than this value times the minimum size of the runs currently included in C.
+
+  ```rust
+  scheduler_options.insert("include_size_threshold".to_string(), "4.0".to_string());
+  ```
+
+  **Considerations:**
+  - Lower values (e.g., 2.0) create tighter size groupings but may increase write amplification
+  - Higher values (e.g., 10.0) allow more runs to be compacted together but may create uneven size distribution
+  - Recommended range: 2.0 to 8.0
+</ParamField>
+
+## Configuration Examples
+
+### High-Throughput Writes
+
+Optimized for write-heavy workloads with plenty of CPU and memory:
+
+```rust
+use slatedb::config::{Settings, CompactorOptions};
+use std::time::Duration;
+use std::collections::HashMap;
+
+let mut scheduler_options = HashMap::new();
+scheduler_options.insert("min_compaction_sources".to_string(), "6".to_string());
+scheduler_options.insert("max_compaction_sources".to_string(), "12".to_string());
+scheduler_options.insert("include_size_threshold".to_string(), "5.0".to_string());
+
+let mut settings = Settings::default();
+settings.compactor_options = Some(CompactorOptions {
+    poll_interval: Duration::from_secs(3),
+    manifest_update_timeout: Duration::from_secs(300),
+    max_sst_size: 512 * 1024 * 1024,  // 512 MiB
+    max_concurrent_compactions: 8,
+    scheduler_options,
+});
+```
+
+### Low-Latency Reads
+
+Optimized for read-heavy workloads requiring low tail latencies:
+
+```rust
+use slatedb::config::{Settings, CompactorOptions};
+use std::time::Duration;
+use std::collections::HashMap;
+
+let mut scheduler_options = HashMap::new();
+scheduler_options.insert("min_compaction_sources".to_string(), "3".to_string());
+scheduler_options.insert("max_compaction_sources".to_string(), "6".to_string());
+scheduler_options.insert("include_size_threshold".to_string(), "3.0".to_string());
+
+let mut settings = Settings::default();
+settings.compactor_options = Some(CompactorOptions {
+    poll_interval: Duration::from_secs(2),
+    manifest_update_timeout: Duration::from_secs(300),
+    max_sst_size: 128 * 1024 * 1024,  // 128 MiB
+    max_concurrent_compactions: 4,
+    scheduler_options,
+});
+```
+
+### Resource-Constrained Environments
+
+Optimized for limited CPU and memory:
+
+```rust
+use slatedb::config::{Settings, CompactorOptions};
+use std::time::Duration;
+use std::collections::HashMap;
+
+let mut scheduler_options = HashMap::new();
+scheduler_options.insert("min_compaction_sources".to_string(), "4".to_string());
+scheduler_options.insert("max_compaction_sources".to_string(), "6".to_string());
+scheduler_options.insert("include_size_threshold".to_string(), "4.0".to_string());
+
+let mut settings = Settings::default();
+settings.compactor_options = Some(CompactorOptions {
+    poll_interval: Duration::from_secs(10),
+    manifest_update_timeout: Duration::from_secs(300),
+    max_sst_size: 128 * 1024 * 1024,  // 128 MiB
+    max_concurrent_compactions: 2,
+    scheduler_options,
+});
+```
+
+## Disabling Compaction
+
+In some scenarios, you may want to run SlateDB without automatic compaction:
+
+```rust
+use slatedb::config::Settings;
+
+let mut settings = Settings::default();
+settings.compactor_options = None;  // Disable automatic compaction
+```
+
+You can still trigger compactions manually or run a separate compactor process. See the [standalone compactor example](https://github.com/slatedb/slatedb/blob/main/examples/src/standalone_compactor.rs) for more details.
+
+## Configuration File Format
+
+### TOML
+
+```toml
+[compactor_options]
+poll_interval = "5s"
+manifest_update_timeout = "300s"
+max_sst_size = 268435456
+max_concurrent_compactions = 4
+
+[compactor_options.scheduler_options]
+min_compaction_sources = "4"
+max_compaction_sources = "8"
+include_size_threshold = "4.0"
+```
+
+### JSON
+
+```json
+{
+  "compactor_options": {
+    "poll_interval": "5s",
+    "manifest_update_timeout": "300s",
+    "max_sst_size": 268435456,
+    "max_concurrent_compactions": 4,
+    "scheduler_options": {
+      "min_compaction_sources": "4",
+      "max_compaction_sources": "8",
+      "include_size_threshold": "4.0"
+    }
+  }
+}
+```
+
+### YAML
+
+```yaml
+compactor_options:
+  poll_interval: '5s'
+  manifest_update_timeout: '300s'
+  max_sst_size: 268435456
+  max_concurrent_compactions: 4
+  scheduler_options:
+    min_compaction_sources: "4"
+    max_compaction_sources: "8"
+    include_size_threshold: "4.0"
+```
+
+## Monitoring Compaction
+
+SlateDB provides metrics to monitor compaction performance:
+
+- `compactor.bytes_compacted`: Total bytes written during compaction
+- `compactor.last_compaction_timestamp_sec`: Unix timestamp of last compaction
+- `compactor.running_compactions`: Number of currently running compactions
+- `compactor.total_bytes_being_compacted`: Total bytes in active compactions
+- `compactor.total_throughput_bytes_per_sec`: Combined throughput across all compactions
+
+See the [Metrics documentation](/api/db) for more details on accessing these metrics.
+
+## Tuning Guidelines
+
+### Write Amplification
+
+Write amplification = (bytes written to object storage) / (bytes written by application)
+
+To reduce write amplification:
+- Increase `min_compaction_sources` and `max_compaction_sources`
+- Increase `max_sst_size` to create fewer, larger SSTables
+- Increase `l0_sst_size_bytes` to reduce L0 SST count
+
+### Space Amplification
+
+Space amplification = (total bytes on disk) / (live data bytes)
+
+To reduce space amplification:
+- Decrease `poll_interval` for more frequent compaction
+- Decrease `min_compaction_sources` to trigger compaction earlier
+- Increase `max_concurrent_compactions` to compact more data in parallel
+
+### Read Amplification
+
+Read amplification = (number of SSTables accessed per read)
+
+To reduce read amplification:
+- More aggressive compaction (lower `min_compaction_sources`)
+- Faster compaction response (`poll_interval`)
+- Enable bloom filters (see [Settings](/configuration/settings))
+
+## Best Practices
+
+<Tip>
+  Start with default settings and adjust based on observed metrics. Monitor write amplification, space amplification, and read latencies to guide tuning.
+</Tip>
+
+1. **Match hardware**: Set `max_concurrent_compactions` based on available CPU cores
+2. **Balance trade-offs**: Optimize for your workload's primary bottleneck (write throughput, read latency, or storage cost)
+3. **Test under load**: Compaction behavior varies significantly with data patterns and write rates
+4. **Monitor proactively**: Watch compaction lag and throughput metrics
+5. **Adjust gradually**: Change one parameter at a time and observe the impact
+
+## Advanced: Custom Compaction Strategies
+
+For advanced use cases, SlateDB allows custom compaction schedulers. Implement the `CompactionScheduler` trait:
+
+```rust
+use slatedb::compactor::{CompactionScheduler, CompactionSpec, CompactorStateView};
+
+pub struct MyCustomScheduler {
+    // your fields
+}
+
+impl CompactionScheduler for MyCustomScheduler {
+    fn propose(&self, state: &CompactorStateView) -> Vec<CompactionSpec> {
+        // Your custom scheduling logic
+        vec![]
+    }
+}
+```
+
+See the [source code](https://github.com/slatedb/slatedb/blob/main/slatedb/src/size_tiered_compaction.rs) for the size-tiered scheduler implementation as a reference.

@@ -1,0 +1,337 @@
+---
+title: 'DbBuilder'
+description: 'Builder for configuring and opening a SlateDB database'
+---
+
+The `DbBuilder` struct provides a fluent API for configuring database options before opening a database instance.
+
+## Creating a Builder
+
+### new
+
+```rust
+pub fn new(path: P, object_store: Arc<dyn ObjectStore>) -> Self
+```
+
+Creates a new `DbBuilder` with the specified path and object store.
+
+<ParamField path="path" type="P: Into<Path>" required>
+  The path to the database in object storage
+</ParamField>
+
+<ParamField path="object_store" type="Arc<dyn ObjectStore>" required>
+  The object store implementation for persistence
+</ParamField>
+
+<ResponseField name="DbBuilder" type="DbBuilder<P>">
+  Returns a new builder instance
+</ResponseField>
+
+```rust
+use slatedb::{Db, Error};
+use slatedb::object_store::memory::InMemory;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    let object_store = Arc::new(InMemory::new());
+    let db = Db::builder("test_db", object_store)
+        .build()
+        .await?;
+    Ok(())
+}
+```
+
+## Configuration Methods
+
+### with_settings
+
+```rust
+pub fn with_settings(mut self, settings: Settings) -> Self
+```
+
+Sets custom database settings.
+
+<ParamField path="settings" type="Settings" required>
+  Database settings including performance tuning parameters
+</ParamField>
+
+<ResponseField name="DbBuilder" type="DbBuilder<P>">
+  Returns the builder for method chaining
+</ResponseField>
+
+```rust
+use slatedb::config::Settings;
+
+let db = Db::builder("test_db", object_store)
+    .with_settings(Settings {
+        min_filter_keys: 2000,
+        ..Default::default()
+    })
+    .build()
+    .await?;
+```
+
+### with_wal_object_store
+
+```rust
+pub fn with_wal_object_store(mut self, wal_object_store: Arc<dyn ObjectStore>) -> Self
+```
+
+Sets a separate object store dedicated to the Write-Ahead Log (WAL).
+
+<ParamField path="wal_object_store" type="Arc<dyn ObjectStore>" required>
+  The object store for WAL files
+</ParamField>
+
+<ResponseField name="DbBuilder" type="DbBuilder<P>">
+  Returns the builder for method chaining
+</ResponseField>
+
+<Info>
+WAL durability and availability depend on the object store properties. Ensure the configured store meets your requirements.
+</Info>
+
+### with_db_cache
+
+```rust
+pub fn with_db_cache(mut self, db_cache: Arc<dyn DbCache>) -> Self
+```
+
+Sets a custom cache for SST blocks and metadata.
+
+<ParamField path="db_cache" type="Arc<dyn DbCache>" required>
+  The cache implementation to use
+</ParamField>
+
+<ResponseField name="DbBuilder" type="DbBuilder<P>">
+  Returns the builder for method chaining
+</ResponseField>
+
+```rust
+use slatedb::db_cache::foyer::FoyerCache;
+
+let db = Db::builder("test_db", object_store)
+    .with_db_cache(Arc::new(FoyerCache::new()))
+    .build()
+    .await?;
+```
+
+### with_db_cache_disabled
+
+```rust
+pub fn with_db_cache_disabled(mut self) -> Self
+```
+
+Disables the SST block/metadata cache.
+
+<ResponseField name="DbBuilder" type="DbBuilder<P>">
+  Returns the builder for method chaining
+</ResponseField>
+
+### with_system_clock
+
+```rust
+pub fn with_system_clock(mut self, clock: Arc<dyn SystemClock>) -> Self
+```
+
+Sets a custom system clock for scheduling operations.
+
+<ParamField path="clock" type="Arc<dyn SystemClock>" required>
+  The system clock implementation
+</ParamField>
+
+<ResponseField name="DbBuilder" type="DbBuilder<P>">
+  Returns the builder for method chaining
+</ResponseField>
+
+```rust
+use slatedb_common::clock::DefaultSystemClock;
+
+let clock = Arc::new(DefaultSystemClock::new());
+let db = Db::builder("test_db", object_store)
+    .with_system_clock(clock)
+    .build()
+    .await?;
+```
+
+### with_gc_runtime
+
+```rust
+pub fn with_gc_runtime(mut self, gc_runtime: Handle) -> Self
+```
+
+Sets a custom Tokio runtime for garbage collection tasks.
+
+<ParamField path="gc_runtime" type="Handle" required>
+  The Tokio runtime handle for GC
+</ParamField>
+
+<ResponseField name="DbBuilder" type="DbBuilder<P>">
+  Returns the builder for method chaining
+</ResponseField>
+
+### with_compactor_builder
+
+```rust
+pub fn with_compactor_builder(mut self, compactor_builder: CompactorBuilder<P>) -> Self
+```
+
+Sets a custom compactor builder for compaction orchestration.
+
+<ParamField path="compactor_builder" type="CompactorBuilder<P>" required>
+  The compactor builder with custom configuration
+</ParamField>
+
+<ResponseField name="DbBuilder" type="DbBuilder<P>">
+  Returns the builder for method chaining
+</ResponseField>
+
+<Warning>
+Setting a `CompactorBuilder` will override any `compactor_options` in `Settings`.
+</Warning>
+
+### with_fp_registry
+
+```rust
+pub fn with_fp_registry(mut self, fp_registry: Arc<FailPointRegistry>) -> Self
+```
+
+Sets a fail point registry for testing fault injection.
+
+<ParamField path="fp_registry" type="Arc<FailPointRegistry>" required>
+  The fail point registry
+</ParamField>
+
+<ResponseField name="DbBuilder" type="DbBuilder<P>">
+  Returns the builder for method chaining
+</ResponseField>
+
+### with_seed
+
+```rust
+pub fn with_seed(mut self, seed: u64) -> Self
+```
+
+Sets the seed for the database's random number generator.
+
+<ParamField path="seed" type="u64" required>
+  The seed value for random operations
+</ParamField>
+
+<ResponseField name="DbBuilder" type="DbBuilder<P>">
+  Returns the builder for method chaining
+</ResponseField>
+
+<Info>
+All random behavior in SlateDB (UUIDs, ULIDs, cache eviction) uses RNGs based on this seed. If not set, SlateDB uses the OS RNG.
+</Info>
+
+### with_sst_block_size
+
+```rust
+pub fn with_sst_block_size(mut self, block_size: SstBlockSize) -> Self
+```
+
+Sets the block size for SSTable blocks.
+
+<ParamField path="block_size" type="SstBlockSize" required>
+  The block size (1KB, 2KB, 4KB, 8KB, 16KB, 32KB, or 64KB)
+</ParamField>
+
+<ResponseField name="DbBuilder" type="DbBuilder<P>">
+  Returns the builder for method chaining
+</ResponseField>
+
+```rust
+use slatedb::config::SstBlockSize;
+
+let db = Db::builder("test_db", object_store)
+    .with_sst_block_size(SstBlockSize::Block8Kib)
+    .build()
+    .await?;
+```
+
+<Note>
+Blocks are the unit of reading and caching. Smaller blocks reduce read amplification but increase metadata overhead. Larger blocks are better for sequential scans but may waste bandwidth for point lookups.
+</Note>
+
+### with_merge_operator
+
+```rust
+pub fn with_merge_operator(mut self, merge_operator: MergeOperatorType) -> Self
+```
+
+Sets a merge operator for the database.
+
+<ParamField path="merge_operator" type="Arc<dyn MergeOperator>" required>
+  The merge operator implementation
+</ParamField>
+
+<ResponseField name="DbBuilder" type="DbBuilder<P>">
+  Returns the builder for method chaining
+</ResponseField>
+
+```rust
+use slatedb::{MergeOperator, MergeOperatorError};
+use bytes::Bytes;
+use std::sync::Arc;
+
+struct StringConcatMergeOperator;
+
+impl MergeOperator for StringConcatMergeOperator {
+    fn merge(&self, _key: &Bytes, existing_value: Option<Bytes>, value: Bytes) 
+        -> Result<Bytes, MergeOperatorError> {
+        let mut result = existing_value.unwrap_or_default().as_ref().to_vec();
+        result.extend_from_slice(&value);
+        Ok(Bytes::from(result))
+    }
+}
+
+let db = Db::builder("test_db", object_store)
+    .with_merge_operator(Arc::new(StringConcatMergeOperator))
+    .build()
+    .await?;
+```
+
+### with_block_transformer
+
+```rust
+pub fn with_block_transformer(mut self, block_transformer: Arc<dyn BlockTransformer>) -> Self
+```
+
+Sets a block transformer for custom encoding/decoding (e.g., encryption).
+
+<ParamField path="block_transformer" type="Arc<dyn BlockTransformer>" required>
+  The block transformer implementation
+</ParamField>
+
+<ResponseField name="DbBuilder" type="DbBuilder<P>">
+  Returns the builder for method chaining
+</ResponseField>
+
+<Info>
+The transformer is applied after compression on write and before decompression on read. The checksum is calculated on the transformed data.
+</Info>
+
+## Building the Database
+
+### build
+
+```rust
+pub async fn build(self) -> Result<Db, Error>
+```
+
+Builds and opens the database with the configured options.
+
+<ResponseField name="Result" type="Result<Db, Error>">
+  Returns a `Db` instance on success, or an error if the database could not be opened
+</ResponseField>
+
+```rust
+let db = Db::builder("test_db", object_store)
+    .with_settings(Settings::default())
+    .with_sst_block_size(SstBlockSize::Block8Kib)
+    .build()
+    .await?;
+```

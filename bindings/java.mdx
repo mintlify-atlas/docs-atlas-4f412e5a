@@ -1,0 +1,445 @@
+---
+title: Java Bindings
+description: Java 24+ bindings for SlateDB using FFM API
+---
+
+SlateDB Java bindings provide a native Java API built on the `slatedb-c` FFI library using the Java Foreign Function and Memory (FFM) API.
+
+## Requirements
+
+- Java 24 or higher (required for FFM API)
+- Supported platforms:
+  - Linux (x86_64, aarch64)
+  - macOS (x86_64, aarch64)
+  - Windows (x86_64, aarch64)
+
+## Installation
+
+### Maven
+
+```xml
+<dependency>
+  <groupId>io.slatedb</groupId>
+  <artifactId>slatedb</artifactId>
+  <version>0.2.0</version>
+</dependency>
+```
+
+### Gradle
+
+```groovy
+implementation "io.slatedb:slatedb:0.2.0"
+```
+
+### Building from Source
+
+```bash
+./gradlew jar
+```
+
+The JAR will be in `slatedb-java/build/libs/slatedb-<version>.jar`.
+
+## Basic Usage
+
+### Hello World
+
+```java
+import io.slatedb.SlateDb;
+import io.slatedb.SlateDbConfig.*;
+
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+
+public class HelloSlateDb {
+    public static void main(String[] args) throws Exception {
+        // Initialize logging
+        SlateDb.initLogging(LogLevel.INFO);
+
+        // Create temp directories
+        Path dbPath = Files.createTempDirectory("slatedb-java-db");
+        Path objectStoreRoot = Files.createTempDirectory("slatedb-java-store");
+        String objectStoreUrl = "file://" + objectStoreRoot.toAbsolutePath();
+
+        // Open database
+        try (SlateDb db = SlateDb.open(dbPath.toString(), objectStoreUrl, null)) {
+            // Put and get
+            byte[] key = "hello".getBytes(StandardCharsets.UTF_8);
+            byte[] value = "world".getBytes(StandardCharsets.UTF_8);
+            
+            db.put(key, value);
+            byte[] result = db.get(key);
+            
+            System.out.println(new String(result, StandardCharsets.UTF_8));
+        }
+    }
+}
+```
+
+### Running with FFM
+
+Enable native access when running:
+
+```bash
+java --enable-native-access=ALL-UNNAMED \
+  -cp slatedb.jar:. \
+  HelloSlateDb
+```
+
+## Write Operations
+
+### Put and Get
+
+```java
+// Put a key-value pair
+SlateDbWriteHandle handle = db.put("user:1".getBytes(), "Alice".getBytes());
+System.out.printf("seq=%d, createTs=%d%n", handle.seq(), handle.createTs());
+
+// Get a value
+byte[] value = db.get("user:1".getBytes());
+if (value != null) {
+    System.out.println(new String(value, StandardCharsets.UTF_8));
+}
+```
+
+### Delete
+
+```java
+db.delete("user:1".getBytes());
+```
+
+### Write with Options
+
+```java
+// Don't wait for durability (faster)
+WriteOptions writeOpts = new WriteOptions(false);
+db.put("key".getBytes(), "value".getBytes(), null, writeOpts);
+
+// With TTL (expires after 1 hour)
+PutOptions putOpts = PutOptions.expireAfter(Duration.ofHours(1));
+db.put("session:123".getBytes(), "data".getBytes(), putOpts, WriteOptions.DEFAULT);
+```
+
+### Batch Writes
+
+```java
+try (SlateDbWriteBatch batch = SlateDb.newWriteBatch()) {
+    batch.put("key1".getBytes(), "value1".getBytes());
+    batch.put("key2".getBytes(), "value2".getBytes());
+    batch.delete("old_key".getBytes());
+    
+    db.write(batch);
+}
+```
+
+## Range Scans
+
+### Basic Scan
+
+```java
+try (SlateDbScanIterator iter = db.scan(
+    "user:".getBytes(StandardCharsets.UTF_8),
+    "user;".getBytes(StandardCharsets.UTF_8)
+)) {
+    SlateDbKeyValue kv;
+    while ((kv = iter.next()) != null) {
+        System.out.printf("%s=%s%n",
+            new String(kv.key(), StandardCharsets.UTF_8),
+            new String(kv.value(), StandardCharsets.UTF_8)
+        );
+    }
+}
+```
+
+### Prefix Scan
+
+```java
+try (SlateDbScanIterator iter = db.scanPrefix("user:".getBytes())) {
+    SlateDbKeyValue kv;
+    while ((kv = iter.next()) != null) {
+        System.out.printf("%s=%s%n",
+            new String(kv.key(), StandardCharsets.UTF_8),
+            new String(kv.value(), StandardCharsets.UTF_8)
+        );
+    }
+}
+```
+
+### Scan with Options
+
+```java
+ScanOptions opts = ScanOptions.builder()
+    .durabilityFilter(Durability.REMOTE)
+    .readAheadBytes(1024 * 1024) // 1MB
+    .cacheBlocks(true)
+    .maxFetchTasks(4)
+    .build();
+
+try (SlateDbScanIterator iter = db.scan(startKey, endKey, opts)) {
+    // Iterate results
+}
+```
+
+## Advanced Configuration
+
+### Using Builder
+
+```java
+String settings = SlateDb.settingsDefault();
+
+try (SlateDb.Builder builder = SlateDb.builder(dbPath, objectStoreUrl, null)) {
+    builder.withSettingsJson(settings)
+           .withSstBlockSize(SstBlockSize.KIB_16);
+    
+    try (SlateDb db = builder.build()) {
+        // Use database
+    }
+}
+```
+
+### Loading Settings
+
+```java
+// Default settings
+String defaults = SlateDb.settingsDefault();
+
+// From file (JSON, TOML, YAML)
+String settings = SlateDb.settingsFromFile("config.toml");
+
+// From environment variables
+String envSettings = SlateDb.settingsFromEnv("SLATEDB_");
+
+// Auto-detect
+String autoSettings = SlateDb.settingsLoad();
+```
+
+## Merge Operators
+
+Define custom merge logic:
+
+```java
+import io.slatedb.SlateDbMergeOperator;
+
+public class CounterMerge implements SlateDbMergeOperator {
+    @Override
+    public byte[] merge(byte[] key, byte[] existing, byte[] value) {
+        long count = 0;
+        if (existing != null) {
+            count = Long.parseLong(new String(existing, StandardCharsets.UTF_8));
+        }
+        long delta = Long.parseLong(new String(value, StandardCharsets.UTF_8));
+        count += delta;
+        return String.valueOf(count).getBytes(StandardCharsets.UTF_8);
+    }
+}
+
+// Use with builder
+try (SlateDb.Builder builder = SlateDb.builder(dbPath, url, null)) {
+    builder.withMergeOperator(new CounterMerge());
+    
+    try (SlateDb db = builder.build()) {
+        db.merge("counter".getBytes(), "1".getBytes());
+        db.merge("counter".getBytes(), "5".getBytes());
+        
+        byte[] result = db.get("counter".getBytes());
+        System.out.println(new String(result)); // "6"
+    }
+}
+```
+
+## Read-Only Access
+
+### SlateDbReader
+
+```java
+import io.slatedb.SlateDbReader;
+
+ReaderOptions opts = ReaderOptions.builder()
+    .manifestPollInterval(Duration.ofSeconds(5))
+    .checkpointLifetime(Duration.ofMinutes(10))
+    .build();
+
+try (SlateDbReader reader = SlateDb.openReader(
+    dbPath,
+    objectStoreUrl,
+    null,
+    null, // checkpoint ID
+    opts
+)) {
+    byte[] value = reader.get("key".getBytes());
+}
+```
+
+### Checkpoint-Pinned Reads
+
+```java
+try (SlateDbReader reader = SlateDb.openReader(
+    dbPath,
+    objectStoreUrl,
+    null,
+    "checkpoint-uuid", // specific checkpoint
+    null
+)) {
+    // Read from checkpoint
+}
+```
+
+## Read Options
+
+```java
+ReadOptions opts = ReadOptions.builder()
+    .durabilityFilter(Durability.REMOTE)
+    .dirty(false)
+    .cacheBlocks(true)
+    .build();
+
+byte[] value = db.get("key".getBytes(), opts);
+```
+
+## Flush Operations
+
+```java
+// Default flush
+db.flush();
+
+// Flush specific target
+db.flush(); // Flushes all
+```
+
+## Metrics
+
+```java
+String metricsJson = db.metrics();
+System.out.println(metricsJson);
+```
+
+## Object Store Configuration
+
+### Memory Store
+
+```java
+SlateDb db = SlateDb.open(dbPath, "memory:///", null);
+```
+
+### File System
+
+```java
+SlateDb db = SlateDb.open(dbPath, "file:///tmp/slatedb-store", null);
+```
+
+### AWS S3
+
+```java
+// Using URL
+SlateDb db = SlateDb.open(dbPath, "s3://my-bucket/prefix", null);
+
+// Using env file
+SlateDb db = SlateDb.open(dbPath, null, ".env");
+```
+
+Example `.env` file:
+
+```bash
+CLOUD_PROVIDER=aws
+AWS_BUCKET=my-bucket
+AWS_REGION=us-west-2
+```
+
+## Error Handling
+
+```java
+import io.slatedb.SlateDbException;
+
+try {
+    byte[] value = db.get("key".getBytes());
+    if (value == null) {
+        System.out.println("Key not found");
+    }
+} catch (SlateDbException e) {
+    System.err.println("Database error: " + e.getMessage());
+}
+```
+
+## Thread Safety
+
+All SlateDB Java types are safe for concurrent use from multiple threads.
+
+## Complete Example
+
+```java
+import io.slatedb.*;
+import io.slatedb.SlateDbConfig.*;
+
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.time.Duration;
+
+public class SlateDbExample {
+    public static void main(String[] args) throws Exception {
+        // Initialize logging
+        SlateDb.initLogging(LogLevel.INFO);
+
+        // Setup paths
+        Path dbPath = Files.createTempDirectory("slatedb-example");
+        Path storeRoot = Files.createTempDirectory("slatedb-store");
+        String storeUrl = "file://" + storeRoot.toAbsolutePath();
+
+        // Open database with custom settings
+        String settings = SlateDb.settingsDefault();
+        
+        try (SlateDb.Builder builder = SlateDb.builder(
+            dbPath.toString(),
+            storeUrl,
+            null
+        )) {
+            builder.withSettingsJson(settings)
+                   .withSstBlockSize(SstBlockSize.KIB_16);
+            
+            try (SlateDb db = builder.build()) {
+                // Write some data
+                db.put("user:1".getBytes(), "Alice".getBytes());
+                db.put("user:2".getBytes(), "Bob".getBytes());
+                db.put("user:3".getBytes(), "Charlie".getBytes());
+
+                // Batch write
+                try (SlateDbWriteBatch batch = SlateDb.newWriteBatch()) {
+                    batch.put("product:1".getBytes(), "Laptop".getBytes());
+                    batch.put("product:2".getBytes(), "Mouse".getBytes());
+                    db.write(batch);
+                }
+
+                // Scan users
+                System.out.println("Users:");
+                try (SlateDbScanIterator iter = db.scanPrefix(
+                    "user:".getBytes()
+                )) {
+                    SlateDbKeyValue kv;
+                    while ((kv = iter.next()) != null) {
+                        System.out.printf("  %s = %s%n",
+                            new String(kv.key(), StandardCharsets.UTF_8),
+                            new String(kv.value(), StandardCharsets.UTF_8)
+                        );
+                    }
+                }
+
+                // Get metrics
+                String metrics = db.metrics();
+                System.out.println("\nMetrics: " + metrics);
+            }
+        }
+    }
+}
+```
+
+## Troubleshooting
+
+### UnsatisfiedLinkError
+
+If you see this error, the JAR doesn't contain a native binary for your platform. Either:
+- Use a Maven Central release (includes all platforms)
+- Build locally with the appropriate platform library
+
+### Native Access Warnings
+
+Always run with `--enable-native-access=ALL-UNNAMED` to avoid warnings.

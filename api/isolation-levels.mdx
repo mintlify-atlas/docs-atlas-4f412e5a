@@ -1,0 +1,205 @@
+---
+title: 'IsolationLevel'
+description: 'Transaction isolation levels for concurrency control'
+---
+
+The `IsolationLevel` enum defines the isolation guarantees for database transactions.
+
+## Variants
+
+### Snapshot
+
+```rust
+IsolationLevel::Snapshot
+```
+
+Snapshot Isolation (SI) - detects write-write conflicts only.
+
+<Info>
+Snapshot Isolation provides a consistent view of the database at the transaction start time. It prevents dirty reads and non-repeatable reads but allows phantom reads.
+</Info>
+
+**Conflict Detection:**
+- Write-write conflicts: Detected and cause transaction abort
+- Read-write conflicts: Not detected
+- Phantom reads: Possible
+
+**Use Cases:**
+- High-concurrency workloads where phantom reads are acceptable
+- Applications that can handle read-write anomalies
+- Performance-critical scenarios where full serializability is not required
+
+```rust
+use slatedb::IsolationLevel;
+
+let txn = db.begin(IsolationLevel::Snapshot).await?;
+txn.put(b"key", b"value")?;
+txn.commit().await?;
+```
+
+### SerializableSnapshot
+
+```rust
+IsolationLevel::SerializableSnapshot
+```
+
+Serializable Snapshot Isolation (SSI) - detects both read-write and write-write conflicts.
+
+<Info>
+SSI provides full serializability by tracking read operations and detecting conflicts with concurrent writes. This prevents all anomalies including phantom reads.
+</Info>
+
+**Conflict Detection:**
+- Write-write conflicts: Detected and cause transaction abort
+- Read-write conflicts: Detected and cause transaction abort
+- Phantom reads: Prevented through range tracking
+
+**Use Cases:**
+- Applications requiring strict serializability guarantees
+- Financial applications where consistency is critical
+- Scenarios where phantom reads must be prevented
+
+```rust
+use slatedb::IsolationLevel;
+
+let txn = db.begin(IsolationLevel::SerializableSnapshot).await?;
+// Reads are tracked for conflict detection
+let value = txn.get(b"key").await?;
+txn.put(b"other_key", b"value")?;
+
+// Commit fails if another transaction modified 'key' after this txn started
+let result = txn.commit().await;
+```
+
+## Comparison
+
+| Feature | Snapshot | SerializableSnapshot |
+|---------|----------|---------------------|
+| Write-write conflicts | Yes | Yes |
+| Read-write conflicts | No | Yes |
+| Phantom read prevention | No | Yes |
+| Performance overhead | Lower | Higher |
+| Serializability | No | Yes |
+
+## Conflict Scenarios
+
+### Write-Write Conflict (Both Levels)
+
+```rust
+use slatedb::IsolationLevel;
+
+// Transaction 1
+let txn1 = db.begin(IsolationLevel::Snapshot).await?;
+txn1.put(b"key", b"value1")?;
+
+// Transaction 2
+let txn2 = db.begin(IsolationLevel::Snapshot).await?;
+txn2.put(b"key", b"value2")?;
+
+// First commit succeeds
+txn1.commit().await?;
+
+// Second commit fails with conflict
+let result = txn2.commit().await;
+assert!(result.is_err());
+```
+
+### Read-Write Conflict (SSI Only)
+
+```rust
+use slatedb::IsolationLevel;
+
+// Transaction 1 (SSI)
+let txn1 = db.begin(IsolationLevel::SerializableSnapshot).await?;
+let value = txn1.get(b"key").await?; // Read is tracked
+txn1.put(b"other_key", b"data")?;
+
+// Meanwhile, Transaction 2 modifies the read key
+db.put(b"key", b"new_value").await?;
+
+// Commit fails because 'key' was modified after txn1's snapshot
+let result = txn1.commit().await;
+assert!(result.is_err());
+```
+
+<Note>
+The same scenario with `IsolationLevel::Snapshot` would succeed because SI doesn't track reads.
+</Note>
+
+### Phantom Read Prevention (SSI Only)
+
+```rust
+use slatedb::IsolationLevel;
+
+// Set up initial data
+db.put(b"key1", b"value1").await?;
+db.put(b"key3", b"value3").await?;
+
+// Transaction 1 scans a range
+let txn1 = db.begin(IsolationLevel::SerializableSnapshot).await?;
+let mut iter = txn1.scan(&b"key1"[..]..=&b"key3"[..]).await?;
+while let Some(_kv) = iter.next().await? {
+    // Scan is tracked
+}
+txn1.put(b"key4", b"value4")?;
+
+// Transaction 2 inserts into the scanned range
+db.put(b"key2", b"value2").await?;
+
+// Commit fails due to phantom conflict
+let result = txn1.commit().await;
+assert!(result.is_err());
+```
+
+## Choosing an Isolation Level
+
+### Use Snapshot Isolation When:
+
+- You need high concurrency and throughput
+- Your application can handle read-write anomalies
+- Phantom reads are acceptable for your use case
+- You're implementing application-level conflict resolution
+
+### Use Serializable Snapshot Isolation When:
+
+- You require strict serializability guarantees
+- Data consistency is critical (e.g., financial applications)
+- Phantom reads must be prevented
+- You prefer the database to handle conflict detection
+
+## Explicit Read Tracking
+
+Both isolation levels support explicit read tracking via `mark_read()`:
+
+```rust
+// Even in Snapshot mode, you can track specific reads
+let txn = db.begin(IsolationLevel::Snapshot).await?;
+
+// Explicitly mark keys as read
+txn.mark_read([b"key1", b"key2"])?;
+
+// These reads will be checked for conflicts even in SI mode
+txn.put(b"other_key", b"value")?;
+txn.commit().await?;
+```
+
+## Write Exclusion from Tracking
+
+Both levels support excluding writes from conflict detection:
+
+```rust
+let txn = db.begin(IsolationLevel::SerializableSnapshot).await?;
+
+// Write to a counter
+txn.put(b"counter", b"1")?;
+
+// Exclude from conflict detection
+txn.unmark_write([b"counter"])?;
+
+// Counter writes won't cause conflicts with other transactions
+txn.commit().await?;
+```
+
+<Warning>
+Use `unmark_write()` carefully - it bypasses conflict detection for those keys.
+</Warning>

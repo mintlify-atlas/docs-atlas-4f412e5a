@@ -1,0 +1,411 @@
+---
+title: 'DbReader'
+description: 'Read-only interface for accessing database data'
+---
+
+The `DbReader` struct provides a read-only interface for accessing database data, either from the latest state or from a specific checkpoint.
+
+## Opening a Reader
+
+### open
+
+```rust
+pub async fn open<P: Into<Path>>(
+    path: P,
+    object_store: Arc<dyn ObjectStore>,
+    checkpoint_id: Option<Uuid>,
+    options: DbReaderOptions,
+) -> Result<Self, Error>
+```
+
+Open a database reader.
+
+<ParamField path="path" type="P: Into<Path>" required>
+  The path to the database
+</ParamField>
+
+<ParamField path="object_store" type="Arc<dyn ObjectStore>" required>
+  The object store to use
+</ParamField>
+
+<ParamField path="checkpoint_id" type="Option<Uuid>">
+  Optional checkpoint ID to read from. If `None`, creates a new checkpoint from current state
+</ParamField>
+
+<ParamField path="options" type="DbReaderOptions" required>
+  Configuration options for the reader
+</ParamField>
+
+<ResponseField name="Result" type="Result<DbReader, Error>">
+  Returns a `DbReader` instance on success
+</ResponseField>
+
+```rust
+use slatedb::{DbReader, config::DbReaderOptions};
+
+let reader = DbReader::open(
+    "test_db",
+    object_store,
+    None,
+    DbReaderOptions::default(),
+).await?;
+```
+
+### builder
+
+```rust
+pub fn builder<P: Into<Path>>(
+    path: P,
+    object_store: Arc<dyn ObjectStore>,
+) -> DbReaderBuilder<P>
+```
+
+Create a builder for configuring a database reader.
+
+<ParamField path="path" type="P: Into<Path>" required>
+  The path to the database
+</ParamField>
+
+<ParamField path="object_store" type="Arc<dyn ObjectStore>" required>
+  The object store to use
+</ParamField>
+
+<ResponseField name="DbReaderBuilder" type="DbReaderBuilder<P>">
+  Returns a builder for configuring the reader
+</ResponseField>
+
+```rust
+let reader = DbReader::builder("test_db", object_store)
+    .build()
+    .await?;
+```
+
+## Read Operations
+
+### get
+
+```rust
+pub async fn get<K: AsRef<[u8]> + Send>(&self, key: K) -> Result<Option<Bytes>, Error>
+```
+
+Get a value from the database.
+
+<ParamField path="key" type="K: AsRef<[u8]> + Send" required>
+  The key to retrieve
+</ParamField>
+
+<ResponseField name="Result" type="Result<Option<Bytes>, Error>">
+  Returns `Some(Bytes)` if the key exists, `None` otherwise
+</ResponseField>
+
+```rust
+let value = reader.get(b"key").await?;
+assert_eq!(value, Some("value".into()));
+```
+
+### get_with_options
+
+```rust
+pub async fn get_with_options<K: AsRef<[u8]> + Send>(
+    &self,
+    key: K,
+    options: &ReadOptions,
+) -> Result<Option<Bytes>, Error>
+```
+
+Get a value with custom read options.
+
+<ParamField path="key" type="K: AsRef<[u8]> + Send" required>
+  The key to retrieve
+</ParamField>
+
+<ParamField path="options" type="&ReadOptions" required>
+  Read options to use
+</ParamField>
+
+<ResponseField name="Result" type="Result<Option<Bytes>, Error>">
+  Returns the value if found
+</ResponseField>
+
+<Note>
+`ReadOptions::read_level` has no effect for readers, which can only observe committed state.
+</Note>
+
+### get_key_value
+
+```rust
+pub async fn get_key_value<K: AsRef<[u8]> + Send>(
+    &self,
+    key: K,
+) -> Result<Option<KeyValue>, Error>
+```
+
+Get a key-value pair with metadata.
+
+<ParamField path="key" type="K: AsRef<[u8]> + Send" required>
+  The key to look up
+</ParamField>
+
+<ResponseField name="Result" type="Result<Option<KeyValue>, Error>">
+  Returns `Some(KeyValue)` with key, value, and metadata
+</ResponseField>
+
+### get_key_value_with_options
+
+```rust
+pub async fn get_key_value_with_options<K: AsRef<[u8]> + Send>(
+    &self,
+    key: K,
+    options: &ReadOptions,
+) -> Result<Option<KeyValue>, Error>
+```
+
+Get a key-value pair with custom options.
+
+<ParamField path="key" type="K: AsRef<[u8]> + Send" required>
+  The key to look up
+</ParamField>
+
+<ParamField path="options" type="&ReadOptions" required>
+  Read options to use
+</ParamField>
+
+<ResponseField name="Result" type="Result<Option<KeyValue>, Error>">
+  Returns the key-value pair with metadata
+</ResponseField>
+
+## Scan Operations
+
+### scan
+
+```rust
+pub async fn scan<K, T>(&self, range: T) -> Result<DbIterator, Error>
+where
+    K: AsRef<[u8]> + Send,
+    T: RangeBounds<K> + Send,
+```
+
+Scan a range of keys.
+
+<ParamField path="range" type="T: RangeBounds<K>" required>
+  The range of keys to scan
+</ParamField>
+
+<ResponseField name="Result" type="Result<DbIterator, Error>">
+  Returns a `DbIterator` for the scan results
+</ResponseField>
+
+```rust
+let mut iter = reader.scan("a".."b").await?;
+let kv = iter.next().await?.unwrap();
+assert_eq!(kv.key.as_ref(), b"a");
+```
+
+### scan_with_options
+
+```rust
+pub async fn scan_with_options<K, T>(
+    &self,
+    range: T,
+    options: &ScanOptions,
+) -> Result<DbIterator, Error>
+where
+    K: AsRef<[u8]> + Send,
+    T: RangeBounds<K> + Send,
+```
+
+Scan a range with custom options.
+
+<ParamField path="range" type="T: RangeBounds<K>" required>
+  The range to scan
+</ParamField>
+
+<ParamField path="options" type="&ScanOptions" required>
+  Scan options to use
+</ParamField>
+
+<ResponseField name="Result" type="Result<DbIterator, Error>">
+  Returns an iterator over the results
+</ResponseField>
+
+```rust
+use slatedb::config::ScanOptions;
+
+let mut iter = reader.scan_with_options("a".."b", &ScanOptions {
+    read_ahead_bytes: 1024 * 1024,
+    ..ScanOptions::default()
+}).await?;
+```
+
+### scan_prefix
+
+```rust
+pub async fn scan_prefix<P>(&self, prefix: P) -> Result<DbIterator, Error>
+where
+    P: AsRef<[u8]> + Send,
+```
+
+Scan all keys with a common prefix.
+
+<ParamField path="prefix" type="P: AsRef<[u8]>" required>
+  The key prefix to scan
+</ParamField>
+
+<ResponseField name="Result" type="Result<DbIterator, Error>">
+  Returns an iterator over matching keys
+</ResponseField>
+
+### scan_prefix_with_options
+
+```rust
+pub async fn scan_prefix_with_options<P>(
+    &self,
+    prefix: P,
+    options: &ScanOptions,
+) -> Result<DbIterator, Error>
+where
+    P: AsRef<[u8]> + Send,
+```
+
+Scan a prefix with custom options.
+
+<ParamField path="prefix" type="P: AsRef<[u8]>" required>
+  The prefix to scan
+</ParamField>
+
+<ParamField path="options" type="&ScanOptions" required>
+  Scan options to use
+</ParamField>
+
+<ResponseField name="Result" type="Result<DbIterator, Error>">
+  Returns an iterator over the results
+</ResponseField>
+
+## Management
+
+### close
+
+```rust
+pub async fn close(&self) -> Result<(), Error>
+```
+
+Close the database reader.
+
+<ResponseField name="Result" type="Result<(), Error>">
+  Returns `Ok(())` on success
+</ResponseField>
+
+```rust
+reader.close().await?;
+```
+
+## Usage Examples
+
+### Basic Reader Usage
+
+```rust
+use slatedb::{Db, DbReader, config::DbReaderOptions, Error};
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    // First create and populate a database
+    let db = Db::open("test_db", Arc::clone(&object_store)).await?;
+    db.put(b"key", b"value").await?;
+    db.flush().await?;
+    
+    // Open a reader
+    let reader = DbReader::open(
+        "test_db",
+        object_store,
+        None,
+        DbReaderOptions::default(),
+    ).await?;
+    
+    // Read data
+    assert_eq!(reader.get(b"key").await?, Some("value".into()));
+    
+    reader.close().await?;
+    Ok(())
+}
+```
+
+### Reading from a Checkpoint
+
+```rust
+// Create a checkpoint in the main database
+let checkpoint = db.create_checkpoint(
+    CheckpointScope::All,
+    &CheckpointOptions::default()
+).await?;
+
+// Open a reader at that checkpoint
+let reader = DbReader::open(
+    "test_db",
+    object_store,
+    Some(checkpoint.id),
+    DbReaderOptions::default(),
+).await?;
+
+// Reader sees data as it was at checkpoint time
+let value = reader.get(b"key").await?;
+```
+
+### Scanning with a Reader
+
+```rust
+let reader = DbReader::open(
+    "test_db",
+    object_store,
+    None,
+    DbReaderOptions::default(),
+).await?;
+
+let mut iter = reader.scan(..).await?;
+while let Some(kv) = iter.next().await? {
+    println!("Key: {:?}, Value: {:?}", kv.key, kv.value);
+}
+```
+
+### Read-Only Analytics
+
+```rust
+use slatedb::config::DbReaderOptions;
+use std::time::Duration;
+
+// Create a reader for analytics workload
+let reader = DbReader::builder("test_db", object_store)
+    .with_options(DbReaderOptions {
+        manifest_poll_interval: Duration::from_secs(5),
+        checkpoint_lifetime: Duration::from_secs(3600),
+        ..Default::default()
+    })
+    .build()
+    .await?;
+
+// Perform analytics queries
+let mut iter = reader.scan_prefix(b"metrics:").await?;
+let mut total = 0;
+let mut count = 0;
+
+while let Some(kv) = iter.next().await? {
+    if let Ok(value) = String::from_utf8_lossy(&kv.value).parse::<i64>() {
+        total += value;
+        count += 1;
+    }
+}
+
+if count > 0 {
+    println!("Average: {}", total / count);
+}
+
+reader.close().await?;
+```
+
+<Info>
+Readers are ideal for analytics workloads as they don't interfere with write operations on the main database.
+</Info>
+
+<Note>
+When no checkpoint ID is provided, the reader automatically creates and manages a checkpoint that is refreshed periodically according to the `manifest_poll_interval`.
+</Note>

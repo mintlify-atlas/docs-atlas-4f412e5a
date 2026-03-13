@@ -1,0 +1,206 @@
+---
+title: 'DbIterator'
+description: 'Iterator for scanning ranges of key-value pairs'
+---
+
+The `DbIterator` struct provides an iterator interface for scanning ranges of keys in the database.
+
+## Methods
+
+### next
+
+```rust
+pub async fn next(&mut self) -> Result<Option<KeyValue>, Error>
+```
+
+Get the next key-value pair from the iterator.
+
+<ResponseField name="Result" type="Result<Option<KeyValue>, Error>">
+  Returns `Some(KeyValue)` if there are more entries, `None` if the iteration is complete, or an error
+</ResponseField>
+
+```rust
+let mut iter = db.scan("a".."z").await?;
+while let Some(kv) = iter.next().await? {
+    println!("Key: {:?}, Value: {:?}", kv.key, kv.value);
+}
+```
+
+### seek
+
+```rust
+pub async fn seek<K: AsRef<[u8]>>(&mut self, next_key: K) -> Result<(), Error>
+```
+
+Seek ahead to the next key. The next key must be:
+- Larger than the last key returned by the iterator
+- Less than the end bound specified in the original scan
+
+<ParamField path="next_key" type="K: AsRef<[u8]>" required>
+  The key to seek to
+</ParamField>
+
+<ResponseField name="Result" type="Result<(), Error>">
+  Returns `Ok(())` on success, or an error if the seek is invalid
+</ResponseField>
+
+```rust
+let mut iter = db.scan("a".."z").await?;
+
+// Get first entry
+let first = iter.next().await?.unwrap();
+assert_eq!(first.key.as_ref(), b"a");
+
+// Seek to a later key
+iter.seek(b"m").await?;
+
+let next = iter.next().await?.unwrap();
+assert!(next.key.as_ref() >= b"m");
+```
+
+<Warning>
+Seek will return an error if:
+- `next_key` is less than or equal to the current iterator position
+- `next_key` is beyond the upper bound of the original scan range
+</Warning>
+
+## Usage Examples
+
+### Basic Iteration
+
+```rust
+use slatedb::{Db, Error};
+use slatedb::object_store::memory::InMemory;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    let object_store = Arc::new(InMemory::new());
+    let db = Db::open("test_db", object_store).await?;
+    
+    // Insert test data
+    db.put(b"apple", b"fruit").await?;
+    db.put(b"banana", b"fruit").await?;
+    db.put(b"carrot", b"vegetable").await?;
+    
+    // Scan all keys
+    let mut iter = db.scan(..).await?;
+    while let Some(kv) = iter.next().await? {
+        println!("{:?} = {:?}", 
+            String::from_utf8_lossy(&kv.key),
+            String::from_utf8_lossy(&kv.value)
+        );
+    }
+    
+    Ok(())
+}
+```
+
+### Range Scans
+
+```rust
+// Scan a specific range
+let mut iter = db.scan("a".."c").await?;
+while let Some(kv) = iter.next().await? {
+    // Will include "apple" and "banana" but not "carrot"
+    println!("Key in range: {:?}", kv.key);
+}
+
+// Scan with inclusive end
+let mut iter = db.scan("a"..="c").await?;
+while let Some(kv) = iter.next().await? {
+    // Includes all three keys
+    println!("Key: {:?}", kv.key);
+}
+
+// Scan from a starting point
+let mut iter = db.scan("b"..).await?;
+while let Some(kv) = iter.next().await? {
+    // Includes "banana" and "carrot"
+    println!("Key: {:?}", kv.key);
+}
+```
+
+### Prefix Scanning
+
+```rust
+db.put(b"user:1:name", b"Alice").await?;
+db.put(b"user:1:email", b"alice@example.com").await?;
+db.put(b"user:2:name", b"Bob").await?;
+db.put(b"post:1:title", b"Hello").await?;
+
+// Scan all keys with "user:" prefix
+let mut iter = db.scan_prefix(b"user:").await?;
+while let Some(kv) = iter.next().await? {
+    // Will include all user:* keys but not post:* keys
+    println!("User data: {:?} = {:?}", kv.key, kv.value);
+}
+
+// Scan all user:1 keys
+let mut iter = db.scan_prefix(b"user:1:").await?;
+while let Some(kv) = iter.next().await? {
+    // Will include only user:1:name and user:1:email
+    println!("User 1 data: {:?}", kv.key);
+}
+```
+
+### Seeking Through Results
+
+```rust
+// Insert sequential keys
+for i in 0..100 {
+    let key = format!("key{:03}", i);
+    db.put(key.as_bytes(), b"value").await?;
+}
+
+// Scan and seek to skip ahead
+let mut iter = db.scan(..).await?;
+
+// Get first entry
+let first = iter.next().await?.unwrap();
+assert_eq!(first.key.as_ref(), b"key000");
+
+// Skip to key050
+iter.seek(b"key050").await?;
+let next = iter.next().await?.unwrap();
+assert_eq!(next.key.as_ref(), b"key050");
+
+// Continue from there
+let next = iter.next().await?.unwrap();
+assert_eq!(next.key.as_ref(), b"key051");
+```
+
+### Collecting Results
+
+```rust
+use std::collections::HashMap;
+
+// Collect scan results into a HashMap
+let mut iter = db.scan_prefix(b"config:").await?;
+let mut config = HashMap::new();
+
+while let Some(kv) = iter.next().await? {
+    let key = String::from_utf8_lossy(&kv.key).to_string();
+    let value = String::from_utf8_lossy(&kv.value).to_string();
+    config.insert(key, value);
+}
+
+println!("Configuration: {:?}", config);
+```
+
+## Iterator Invalidation
+
+Iterators can become invalidated if an underlying error occurs during iteration. Once invalidated, all subsequent operations will return the same error:
+
+```rust
+let mut iter = db.scan(..).await?;
+
+// If an error occurs during iteration
+let result = iter.next().await;
+if let Err(e) = result {
+    // Iterator is now invalidated
+    // All future operations will return the same error
+    let result2 = iter.next().await; // Returns same error
+    let result3 = iter.seek(b"key").await; // Returns same error
+}
+```

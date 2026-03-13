@@ -1,0 +1,385 @@
+---
+title: Checkpoint
+description: API reference for checkpoint creation, management, and recovery
+---
+
+## Overview
+
+Checkpoints provide a way to create consistent, point-in-time snapshots of a SlateDB database. They can be used for:
+
+- **Backup and recovery**: Create periodic backups for disaster recovery
+- **Clone databases**: Create independent copies of a database from a checkpoint
+- **Time-travel queries**: Access historical database states
+- **Long-running transactions**: Create a consistent view for extended operations
+
+## Checkpoint Structure
+
+```rust
+pub struct Checkpoint {
+    pub id: Uuid,
+    pub manifest_id: u64,
+    pub expire_time: Option<DateTime<Utc>>,
+    pub create_time: DateTime<Utc>,
+    pub name: Option<String>,
+}
+```
+
+<ResponseField name="id" type="Uuid">
+  Unique identifier for the checkpoint.
+</ResponseField>
+
+<ResponseField name="manifest_id" type="u64">
+  The manifest version this checkpoint references.
+</ResponseField>
+
+<ResponseField name="expire_time" type="Option<DateTime<Utc>>">
+  Optional expiration time. `None` means the checkpoint never expires.
+</ResponseField>
+
+<ResponseField name="create_time" type="DateTime<Utc>">
+  When the checkpoint was created.
+</ResponseField>
+
+<ResponseField name="name" type="Option<String>">
+  Optional human-readable name for the checkpoint.
+</ResponseField>
+
+## Creating Checkpoints
+
+### create_checkpoint()
+
+Creates a checkpoint of an opened database.
+
+```rust
+pub async fn create_checkpoint(
+    &self,
+    scope: CheckpointScope,
+    options: &CheckpointOptions,
+) -> Result<CheckpointCreateResult, Error>
+```
+
+<ParamField path="scope" type="CheckpointScope" required>
+  The scope of data to include in the checkpoint.
+</ParamField>
+
+<ParamField path="options" type="&CheckpointOptions" required>
+  Options controlling checkpoint creation.
+</ParamField>
+
+#### Returns
+
+`CheckpointCreateResult` containing the checkpoint ID and referenced manifest ID.
+
+```rust
+pub struct CheckpointCreateResult {
+    pub id: Uuid,
+    pub manifest_id: u64,
+}
+```
+
+#### Example
+
+```rust
+use slatedb::config::{CheckpointScope, CheckpointOptions};
+use std::time::Duration;
+
+// Create a checkpoint with all data
+let result = db.create_checkpoint(
+    CheckpointScope::All,
+    &CheckpointOptions::default(),
+).await?;
+
+println!("Created checkpoint: {}", result.id);
+println!("Manifest ID: {}", result.manifest_id);
+```
+
+### CheckpointScope
+
+Defines the scope of data to include in the checkpoint:
+
+```rust
+pub enum CheckpointScope {
+    All,
+    Durable,
+}
+```
+
+<ResponseField name="All" type="CheckpointScope">
+  Includes all writes issued at checkpoint creation time. Forces a flush of in-memory data if needed.
+</ResponseField>
+
+<ResponseField name="Durable" type="CheckpointScope">
+  Includes only writes that were durable at checkpoint creation time. Faster but may not include recent writes.
+</ResponseField>
+
+### CheckpointOptions
+
+Options for checkpoint creation:
+
+```rust
+pub struct CheckpointOptions {
+    pub lifetime: Option<Duration>,
+    pub source: Option<Uuid>,
+    pub name: Option<String>,
+}
+```
+
+<ParamField path="lifetime" type="Option<Duration>">
+  Checkpoint lifetime. The expire time will be set to current time + lifetime. `None` means no expiration.
+</ParamField>
+
+<ParamField path="source" type="Option<Uuid>">
+  Optionally create a checkpoint from an existing checkpoint instead of the current database state.
+</ParamField>
+
+<ParamField path="name" type="Option<String>">
+  Optional name for the checkpoint for easier identification.
+</ParamField>
+
+#### Example with Options
+
+```rust
+use slatedb::config::{CheckpointScope, CheckpointOptions};
+use std::time::Duration;
+
+// Create a named checkpoint that expires in 24 hours
+let options = CheckpointOptions {
+    lifetime: Some(Duration::from_secs(86400)),
+    source: None,
+    name: Some("daily-backup".to_string()),
+};
+
+let result = db.create_checkpoint(
+    CheckpointScope::All,
+    &options,
+).await?;
+```
+
+## Managing Checkpoints
+
+### List Checkpoints
+
+List all checkpoints or filter by name:
+
+```rust
+// List all checkpoints
+let all = admin.list_checkpoints(None).await?;
+
+// List checkpoints with a specific name
+let named = admin.list_checkpoints(Some("daily-backup")).await?;
+```
+
+### Refresh Checkpoint
+
+Extend the lifetime of an existing checkpoint:
+
+```rust
+use std::time::Duration;
+
+admin.refresh_checkpoint(
+    checkpoint_id,
+    Some(Duration::from_secs(86400)), // Extend by 24 hours
+).await?;
+```
+
+### Delete Checkpoint
+
+Manually delete a checkpoint:
+
+```rust
+admin.delete_checkpoint(checkpoint_id).await?;
+```
+
+<Note>
+Checkpoints are also automatically deleted when they expire (if a lifetime was set).
+</Note>
+
+## Using Checkpoints
+
+### Create Database from Checkpoint
+
+Open a database from a checkpoint for read-only access:
+
+```rust
+use slatedb::DbReader;
+
+let reader = DbReader::from_checkpoint(
+    path,
+    object_store,
+    checkpoint_id,
+).await?;
+
+let value = reader.get(b"key").await?;
+```
+
+### Clone Database from Checkpoint
+
+Create an independent writable copy of a database:
+
+```rust
+use slatedb::admin::AdminBuilder;
+
+let admin = AdminBuilder::new(source_path, object_store).build();
+
+admin.clone_db(
+    dest_path,
+    Some(checkpoint_id),
+).await?;
+
+// Now you can open the cloned database
+let cloned_db = Db::open(dest_path, object_store).await?;
+```
+
+## Checkpoint Lifecycle
+
+### Creation
+
+1. Checkpoint creation optionally forces a flush of in-memory data
+2. A new manifest version is created with the checkpoint reference
+3. The checkpoint ID and manifest ID are returned
+
+### Expiration
+
+Checkpoints with a `lifetime` set automatically expire:
+
+1. The garbage collector periodically checks for expired checkpoints
+2. Expired checkpoints are removed from the manifest
+3. Files referenced only by expired checkpoints become eligible for GC
+
+### Manual Deletion
+
+Checkpoints can be manually deleted before expiration:
+
+1. The checkpoint is removed from the manifest
+2. Files referenced only by that checkpoint become eligible for GC
+3. Readers using the checkpoint can still access data until GC runs
+
+## Checkpoint Protection
+
+Data referenced by active checkpoints is protected from garbage collection:
+
+- **Manifest files**: Manifests referenced by checkpoints are retained
+- **WAL SSTs**: WAL data needed for checkpoint recovery is retained
+- **Compacted SSTs**: SSTables in checkpoint-referenced manifests are retained
+
+<Warning>
+Ensure checkpoint lifetimes are shorter than garbage collection `min_age` settings to avoid data loss.
+</Warning>
+
+## Examples
+
+### Periodic Backup Strategy
+
+```rust
+use std::time::Duration;
+use slatedb::config::{CheckpointScope, CheckpointOptions};
+
+// Create daily checkpoints with 7-day retention
+let options = CheckpointOptions {
+    lifetime: Some(Duration::from_secs(7 * 86400)),
+    source: None,
+    name: Some(format!("daily-{}", chrono::Utc::now().format("%Y%m%d"))),
+};
+
+let checkpoint = db.create_checkpoint(
+    CheckpointScope::All,
+    &options,
+).await?;
+
+println!("Created backup checkpoint: {}", checkpoint.id);
+```
+
+### Point-in-Time Recovery
+
+```rust
+use slatedb::DbReader;
+
+// Open a reader at a specific checkpoint
+let reader = DbReader::from_checkpoint(
+    path,
+    object_store,
+    checkpoint_id,
+).await?;
+
+// Access data as it was at checkpoint creation
+let historical_value = reader.get(b"key").await?;
+```
+
+### Database Migration
+
+```rust
+use slatedb::admin::AdminBuilder;
+
+// 1. Create checkpoint of source database
+let checkpoint = source_db.create_checkpoint(
+    CheckpointScope::All,
+    &CheckpointOptions::default(),
+).await?;
+
+// 2. Clone to new location
+let admin = AdminBuilder::new(source_path, object_store).build();
+admin.clone_db(dest_path, Some(checkpoint.id)).await?;
+
+// 3. Open cloned database with new configuration
+let mut new_settings = Settings::default();
+new_settings.l0_sst_size_bytes = 128 * 1024 * 1024; // Larger L0 size
+
+let migrated_db = Db::builder(dest_path, object_store)
+    .with_settings(new_settings)
+    .build()
+    .await?;
+```
+
+### Checkpoint from Checkpoint
+
+Create a new checkpoint with different metadata from an existing one:
+
+```rust
+use std::time::Duration;
+
+// Create initial checkpoint
+let initial = db.create_checkpoint(
+    CheckpointScope::All,
+    &CheckpointOptions {
+        lifetime: Some(Duration::from_secs(3600)),
+        name: Some("temp".to_string()),
+        source: None,
+    },
+).await?;
+
+// Create long-lived checkpoint from the initial one
+let permanent = db.create_checkpoint(
+    CheckpointScope::All,
+    &CheckpointOptions {
+        lifetime: None, // Never expires
+        name: Some("permanent-backup".to_string()),
+        source: Some(initial.id), // Reference the same data
+    },
+).await?;
+```
+
+## Best Practices
+
+### Checkpoint Naming
+
+- Use descriptive names for important checkpoints
+- Include timestamps in checkpoint names for easy identification
+- Use consistent naming schemes for automated backups
+
+### Lifetime Management
+
+- Set appropriate lifetimes based on recovery requirements
+- Shorter lifetimes reduce storage costs
+- Ensure lifetimes align with backup rotation policies
+
+### Performance Considerations
+
+- Use `CheckpointScope::Durable` for faster checkpoint creation
+- Use `CheckpointScope::All` when complete data coverage is required
+- Schedule checkpoint creation during low-traffic periods
+
+### Storage Costs
+
+- Monitor checkpoint count and referenced data size
+- Implement checkpoint cleanup policies
+- Use checkpoint-from-checkpoint to extend specific checkpoints without duplicating data

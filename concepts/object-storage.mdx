@@ -1,0 +1,514 @@
+---
+title: Object Storage
+description: How SlateDB leverages cloud object storage for bottomless, durable, and cost-effective storage
+---
+
+SlateDB is built from the ground up to use **object storage** (Amazon S3, Google Cloud Storage, Azure Blob Storage, MinIO, etc.) as its primary persistence layer. This design choice provides unique advantages but also requires careful optimization to overcome the inherent trade-offs of object storage.
+
+## Why Object Storage?
+
+Object storage offers compelling benefits for a cloud-native storage engine:
+
+### Advantages
+
+1. **Bottomless Capacity**: No need to provision or manage disk capacity. Storage scales automatically with your data.
+
+2. **High Durability**: Cloud providers typically offer 99.999999999% (11 nines) durability through automatic replication across availability zones or regions.
+
+3. **Cost-Effective**: Object storage is 3-10x cheaper than block storage (EBS, persistent disks) for the same durability level.
+
+4. **Simplified Operations**: No need to manage disk failures, RAID configurations, or replication. The cloud provider handles it.
+
+5. **Multi-Process Access**: Multiple processes (or even applications) can safely read the same SlateDB instance from object storage.
+
+6. **Separation of Compute and Storage**: Scale read and write capacity independently. Move compute across machines/regions without data migration.
+
+### Trade-offs
+
+1. **Higher Latency**: Object storage GET/PUT operations typically take 10-100ms vs. microseconds for local disk.
+
+2. **API Costs**: Each GET/PUT has a cost (e.g., $0.0004 per 1000 GETs on S3).
+
+3. **No Random Writes**: Objects are immutable once written. No in-place updates.
+
+4. **List Operations**: Listing objects is slow and expensive compared to filesystem directory listings.
+
+5. **Consistency Models**: Some object stores (historical S3) had eventual consistency, though most now offer strong consistency.
+
+## Supported Object Stores
+
+SlateDB uses the [`object_store`](https://docs.rs/object_store/) crate, which provides a unified interface to multiple object storage backends:
+
+- **Amazon S3** (and S3-compatible stores)
+- **Google Cloud Storage (GCS)**
+- **Azure Blob Storage (ABS)**
+- **Local Filesystem** (for testing)
+- **In-Memory** (for testing)
+- **MinIO**
+- **Cloudflare R2**
+- **Tigris**
+
+See: `slatedb/src/object_stores.rs`
+
+## Storage Layout
+
+SlateDB organizes data in object storage using a simple directory structure:
+
+```
+/{db_path}/
+├── manifest/
+│   ├── 00000000000000000001.manifest
+│   ├── 00000000000000000002.manifest
+│   └── 00000000000000000003.manifest (current)
+├── wal/
+│   ├── 00000000000000000001.sst
+│   ├── 00000000000000000002.sst
+│   └── 00000000000000000003.sst
+└── compacted/
+    ├── 01ARZ3NDEKTSV4RRFFQ69G5FAV.sst
+    ├── 01BX5ZZKBKACTAV9WEVGEMMVRZ.sst
+    ├── 01C4QXZZXXYY9BCCMQWWZ4ZGQQ.sst
+    └── ...
+```
+
+### Directory Structure
+
+#### `/manifest/`
+
+Contains the manifest files that represent the database state:
+
+- **Naming**: Zero-padded 20-digit sequence numbers (`00000000000000000001.manifest`)
+- **Contents**: Serialized manifest with L0 SSTs, sorted runs, sequence numbers, writer epoch
+- **Updates**: New manifest created on every state change
+- **Garbage Collection**: Old manifests deleted after grace period
+
+See: `slatedb/src/manifest/store.rs`
+
+#### `/wal/`
+
+Contains Write-Ahead Log SSTs for durability:
+
+- **Naming**: Zero-padded 20-digit sequential IDs (`00000000000000000001.sst`)
+- **Contents**: Batch of writes from MemTable
+- **Lifecycle**: Written on flush interval, compacted to L0, then garbage collected
+
+See: `slatedb/src/wal_buffer.rs`
+
+#### `/compacted/`
+
+Contains all compacted SSTs (L0 and sorted runs):
+
+- **Naming**: ULIDs (Universally Unique Lexicographically Sortable IDs)
+- **Contents**: Sorted key-value pairs in SST format
+- **Immutability**: Written once, never modified
+- **Garbage Collection**: Deleted only when no longer referenced in any manifest
+
+See: `slatedb/src/db_state.rs`
+
+## Object Immutability
+
+SlateDB treats all objects as **immutable**:
+
+- SSTs are written once and never modified
+- Manifest updates create new files instead of modifying existing ones
+- This enables safe concurrent reads and simplified caching
+- Garbage collection removes obsolete objects asynchronously
+
+**Benefits:**
+- No need for distributed locks on SSTs
+- Aggressive caching without invalidation concerns
+- Simplified recovery and time-travel debugging
+
+## Compare-and-Swap (CAS) Operations
+
+SlateDB requires **atomic conditional writes** for the manifest to ensure correctness. However, not all object stores support CAS natively.
+
+### CAS Support by Provider
+
+| Provider | CAS Support | Mechanism |
+|----------|-------------|------------|
+| Google Cloud Storage | ✅ Native | `If-Generation-Match` header |
+| Azure Blob Storage | ✅ Native | `If-Match` / `If-None-Match` with ETags |
+| Amazon S3 | ❌ No* | Two-phase commit with DynamoDB |
+| MinIO | ✅ Native | S3-compatible ETags |
+| Cloudflare R2 | ✅ Native | S3-compatible ETags |
+
+*S3 supports object versioning but not true CAS.
+
+### Two-Phase Commit for S3
+
+SlateDB implements a **two-phase commit protocol** for S3 using a transactional store (like DynamoDB):
+
+```
+┌──────────────────────────────────────────────────────┐
+│              Two-Phase Write Protocol                │
+└──────────────────────────────────────────────────────┘
+
+1. Write object to temporary location:
+   PUT /manifest/00000042.manifest.{uuid}.{checksum}
+
+2. Write record to DynamoDB (atomic):
+   {
+     destination: "manifest/00000042.manifest",
+     source: "manifest/00000042.manifest.{uuid}.{checksum}",
+     committed: false
+   }
+   // This step is atomic - only one writer succeeds
+
+3. Copy from temp to final location:
+   COPY /manifest/00000042.manifest.{uuid}.{checksum}
+     -> /manifest/00000042.manifest
+
+4. Mark as committed in DynamoDB:
+   UPDATE { committed: true }
+
+5. Delete temporary file:
+   DELETE /manifest/00000042.manifest.{uuid}.{checksum}
+```
+
+See RFC: `rfcs/0001-manifest.md:169-195`
+
+**Recovery**: If a writer fails mid-protocol, a background recovery process:
+1. Finds uncommitted records in DynamoDB
+2. Completes the copy operation
+3. Marks as committed
+4. Cleans up temporary files
+
+## Optimizations for Object Storage
+
+SlateDB employs several strategies to minimize latency and API costs:
+
+### 1. Write Batching
+
+**Problem**: Each small write as a separate PUT is slow and expensive.
+
+**Solution**: Buffer writes and flush periodically:
+
+```rust
+pub struct Settings {
+    pub flush_interval: Duration,  // Default: 1 second
+    pub l0_sst_size_bytes: usize, // Default: configurable
+}
+```
+
+- Writes accumulate in MemTable
+- WAL buffer batches multiple writes
+- Single PUT to `/wal/{id}.sst` covers many operations
+- L0 SSTs written only when MemTable reaches threshold
+
+**Impact**: Reduces PUT API calls by 100-1000x for typical workloads.
+
+See: `slatedb/src/wal_buffer.rs`
+
+### 2. Multi-Tier Caching
+
+**Problem**: Object storage GETs are slow (10-100ms) and costly.
+
+**Solution**: Aggressive caching at multiple levels:
+
+```
+┌─────────────────────────────────────────────┐
+│           Read Path with Caching            │
+└─────────────────────────────────────────────┘
+
+1. Block Cache (Memory)
+   • LRU cache of 4KB data blocks
+   • Typical size: 100MB - 1GB
+   • Eliminates repeated GETs for hot data
+
+2. Index Cache (Memory)
+   • SST index blocks
+   • Small but high value
+   • Enables fast key lookups without I/O
+
+3. Filter Cache (Memory)
+   • Bloom filters for negative lookups
+   • Avoids GET when key definitely not present
+
+4. Disk Cache (Local SSD)
+   • Optional persistent cache
+   • Survives process restarts
+   • Much cheaper than memory for large working sets
+```
+
+See: `slatedb/src/db_cache.rs`
+
+**Cache Hit Rate Impact:**
+
+| Cache Hit Rate | GETs per Read | Latency |
+|---------------|---------------|----------|
+| 0% (cold) | 2-3 | 50-150ms |
+| 50% | 1-1.5 | 25-75ms |
+| 90% | 0.2-0.3 | 5-15ms |
+| 99% | 0.02-0.03 | 1-2ms |
+
+### 3. Bloom Filters
+
+**Problem**: Must check many SSTs for a key that doesn't exist.
+
+**Solution**: Use probabilistic bloom filters:
+
+```rust
+// Before reading SST from object storage:
+if !sst.bloom_filter.may_contain(key) {
+    // Key definitely not in SST, skip GET
+    continue;
+}
+
+// Key might be in SST, do GET
+let block = fetch_from_object_storage(sst, block_id).await?;
+```
+
+**Impact**: Reduces GET operations by ~90% for point lookups of missing keys.
+
+See: `slatedb/src/filter.rs`
+
+### 4. Sorted Runs Instead of Large SSTs
+
+**Problem**: Very large SSTs (GB-scale) have large index blocks that:
+- Don't fit in memory
+- Are expensive to cache
+- Must be fetched repeatedly
+
+**Solution**: Partition data into **Sorted Runs** of smaller SSTs:
+
+```
+Instead of:
+  Single 10GB SST with 10MB index
+
+Use:
+  Sorted Run with 100 SSTs of 100MB each
+  Each SST has ~100KB index
+```
+
+**Benefits:**
+- Smaller index blocks fit in cache
+- Only fetch relevant SST for a key range
+- Better cache locality
+
+See RFC: `rfcs/0002-compaction.md:89-97`
+
+### 5. Prefetching and Pipelining
+
+**Range Scans**: Prefetch multiple blocks in parallel:
+
+```rust
+pub struct SstIteratorOptions {
+    pub max_fetch_tasks: usize,   // Concurrent fetches
+    pub blocks_to_fetch: usize,   // Prefetch depth
+}
+```
+
+Pipeline GET requests to hide latency.
+
+See: `slatedb/src/sst_iter.rs`
+
+### 6. Compression
+
+Reduce object sizes to minimize transfer time and cost:
+
+```rust
+pub enum CompressionCodec {
+    None,
+    Snappy,  // Fast, moderate compression
+    Zstd,    // Slower, better compression
+    Lz4,     // Very fast, light compression
+}
+```
+
+**Trade-off**: CPU cost vs. network/storage savings.
+
+See: `slatedb/src/compression.rs`
+
+## Network Bandwidth Considerations
+
+Object storage access is limited by network bandwidth:
+
+### AWS EC2 Network Bandwidth (Examples)
+
+| Instance Type | Network (Gbps) | S3 Throughput |
+|--------------|----------------|----------------|
+| m6i.large | Up to 12.5 | ~1.5 GB/s |
+| m6i.2xlarge | Up to 12.5 | ~1.5 GB/s |
+| m6i.8xlarge | 12.5 | ~1.5 GB/s |
+| m6i.16xlarge | 25 | ~3 GB/s |
+
+See Appendix: `rfcs/0002-compaction.md:Appendix`
+
+**Implications:**
+
+1. **Write throughput** limited by network, not disk
+2. **Compaction** can saturate network on smaller instances
+3. **Separate writer and compactor** can double effective bandwidth
+4. **Cache misses** more expensive than local disk misses
+
+## Distributed Architecture Benefits
+
+Object storage enables SlateDB's distributed capabilities:
+
+### Multiple Readers
+
+Multiple processes can read the same database:
+
+```
+┌─────────────┐  ┌─────────────┐  ┌─────────────┐
+│  Reader 1   │  │  Reader 2   │  │  Reader 3   │
+│  (EU)       │  │  (US)       │  │  (ASIA)     │
+└──────┬──────┘  └──────┬──────┘  └──────┬──────┘
+       │                │                │
+       └────────────────┴────────────────┘
+                        │
+                        ▼
+             ┌─────────────────────┐
+             │   Object Storage    │
+             │   (Global)          │
+             └─────────────────────┘
+```
+
+- Each reader maintains local cache
+- Readers poll manifest for updates
+- No coordination required between readers
+
+### Separate Writer and Compactor
+
+```
+┌──────────────┐              ┌──────────────┐
+│   Writer     │              │  Compactor   │
+│              │              │              │
+│  • MemTable  │              │  • L0→L1+    │
+│  • WAL       │              │  • SR merge  │
+│  • L0 flush  │              │              │
+└──────┬───────┘              └──────┬───────┘
+       │                             │
+       └─────────────┬───────────────┘
+                     ▼
+          ┌─────────────────────┐
+          │   Object Storage    │
+          │  • manifest/        │
+          │  • wal/             │
+          │  • compacted/       │
+          └─────────────────────┘
+```
+
+**Benefits:**
+- Offload compaction from write path
+- Better network utilization
+- Scale compaction independently
+- Writer restarts don't interrupt compaction
+
+See: `slatedb/src/compactor.rs`
+
+### Clone and Restore
+
+Create database clones by copying manifest:
+
+```rust
+let clone = db.create_clone("clone-path").await?;
+```
+
+- Instant clones (manifest copy only)
+- SSTs are shared (read-only)
+- Copy-on-write for new writes
+- Useful for testing, backups, data science
+
+See: `slatedb/src/admin.rs`
+
+## Cost Optimization Strategies
+
+Minimize object storage costs:
+
+### 1. Reduce API Calls
+
+- Batch writes (fewer PUTs)
+- Aggressive caching (fewer GETs)
+- Bloom filters (avoid negative GETs)
+
+**Example Cost Savings:**
+```
+Without batching: 1M writes = 1M PUTs = $5
+With batching:    1M writes = 100 PUTs = $0.0005
+```
+
+### 2. Use Storage Tiers
+
+- **Hot tier** (S3 Standard): Recent data, frequent access
+- **Warm tier** (S3 Infrequent Access): Older compacted data
+- **Cold tier** (S3 Glacier): Long-term archives
+
+### 3. Lifecycle Policies
+
+Automatic tiering based on age:
+
+```json
+{
+  "Rules": [
+    {
+      "Id": "tier-old-compacted",
+      "Filter": { "Prefix": "compacted/" },
+      "Transitions": [
+        { "Days": 30, "StorageClass": "INTELLIGENT_TIERING" }
+      ]
+    }
+  ]
+}
+```
+
+### 4. Compression
+
+Reduce storage and transfer costs:
+
+- Snappy: 2-3x compression, fast
+- Zstd: 3-5x compression, moderate speed
+
+## Debugging and Observability
+
+### Listing Objects
+
+```bash
+# List all SSTs
+aws s3 ls s3://my-bucket/my-db/compacted/ --recursive
+
+# List manifests
+aws s3 ls s3://my-bucket/my-db/manifest/
+
+# List WAL
+aws s3 ls s3://my-bucket/my-db/wal/
+```
+
+### Inspecting Manifest
+
+Download and decode:
+
+```bash
+aws s3 cp s3://my-bucket/my-db/manifest/00000042.manifest .
+slatedb-cli manifest decode 00000042.manifest
+```
+
+### Metrics
+
+Track object storage usage:
+
+- `object_store.get.count` - GET operations
+- `object_store.put.count` - PUT operations  
+- `object_store.get.bytes` - Download bytes
+- `object_store.put.bytes` - Upload bytes
+- `cache.hit.rate` - Cache effectiveness
+
+See: `slatedb/src/stats.rs`
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Architecture" icon="sitemap" href="/concepts/architecture">
+    Understand the overall system design
+  </Card>
+  <Card title="LSM-Tree" icon="layer-group" href="/concepts/lsm-tree">
+    Learn about LSM-tree implementation
+  </Card>
+  <Card title="Durability" icon="shield-check" href="/concepts/durability">
+    Explore durability guarantees
+  </Card>
+  <Card title="Configuration" icon="sliders" href="/configuration/settings">
+    Configure object storage settings
+  </Card>
+</CardGroup>

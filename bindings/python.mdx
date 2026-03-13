@@ -1,0 +1,549 @@
+---
+title: Python Bindings
+description: Python bindings for SlateDB with async support
+---
+
+SlateDB's Python bindings provide both synchronous and asynchronous APIs built using [Maturin](https://www.maturin.rs/).
+
+## Installation
+
+```bash
+pip install slatedb
+```
+
+### Requirements
+
+- Python 3.10 or higher
+
+## Basic Usage
+
+### Opening a Database
+
+```python
+from slatedb import SlateDB
+
+# Open database with in-memory object store
+db = SlateDB("/tmp/my-db", url="memory:///")
+
+try:
+    # Use database
+    pass
+finally:
+    db.close()
+```
+
+### Context Manager
+
+```python
+# Recommended: use context manager
+with SlateDB("/tmp/my-db", url="memory:///") as db:
+    db.put(b"key", b"value")
+    value = db.get(b"key")
+    print(value)  # b'value'
+```
+
+### Async Open
+
+```python
+import asyncio
+from slatedb import SlateDB
+
+async def main():
+    db = await SlateDB.open_async("/tmp/my-db", url="memory:///")
+    try:
+        await db.put_async(b"key", b"value")
+        value = await db.get_async(b"key")
+        print(value)
+    finally:
+        await db.close_async()
+
+asyncio.run(main())
+```
+
+## Write Operations
+
+### Put and Get
+
+```python
+# Synchronous
+db.put(b"user:1", b"Alice")
+value = db.get(b"user:1")
+print(value)  # b'Alice'
+
+# Asynchronous
+await db.put_async(b"user:2", b"Bob")
+value = await db.get_async(b"user:2")
+```
+
+### Delete
+
+```python
+# Synchronous
+db.delete(b"user:1")
+
+# Asynchronous
+await db.delete_async(b"user:2")
+```
+
+### Write with Options
+
+```python
+# TTL (expires after 5 seconds = 5000ms)
+db.put_with_options(b"session:123", b"data", ttl=5000)
+
+# Don't wait for durability (faster)
+db.put_with_options(b"key", b"value", await_durable=False)
+
+# Both
+db.put_with_options(
+    b"temp",
+    b"value",
+    ttl=60000,
+    await_durable=False
+)
+```
+
+### Write Batches
+
+```python
+from slatedb import WriteBatch
+
+batch = WriteBatch()
+batch.put(b"key1", b"value1")
+batch.put(b"key2", b"value2")
+batch.delete(b"old_key")
+
+# Execute batch atomically
+db.write(batch)
+
+# Async
+await db.write_async(batch)
+```
+
+### Batch with Options
+
+```python
+batch = WriteBatch()
+batch.put_with_options(b"key1", b"value1", ttl=3600000)
+batch.merge(b"counter", b"1")  # requires merge operator
+
+db.write_with_options(batch, await_durable=False)
+```
+
+## Range Scans
+
+### Basic Scan
+
+```python
+# Scan from "user:" to "user;" (prefix range)
+for key, value in db.scan(b"user:", b"user;"):
+    print(f"{key.decode()}={value.decode()}")
+
+# Async iteration
+async for key, value in db.scan_async(b"user:"):
+    print(f"{key.decode()}={value.decode()}")
+```
+
+### Prefix Scan
+
+```python
+# Scan all keys with prefix "user:"
+for key, value in db.scan_prefix(b"user:"):
+    print(f"{key.decode()}={value.decode()}")
+
+# Async
+async for key, value in await db.scan_prefix_async(b"user:"):
+    print(f"{key.decode()}={value.decode()}")
+```
+
+### Scan with Options
+
+```python
+for key, value in db.scan_with_options(
+    b"user:",
+    durability_filter="remote",
+    cache_blocks=True,
+    read_ahead_bytes=1024 * 1024  # 1MB
+):
+    print(f"{key.decode()}={value.decode()}")
+```
+
+### Iterator Seeking
+
+```python
+iter = db.scan(b"user:")
+
+# Get first item
+key, value = next(iter)
+
+# Seek forward to specific key
+iter.seek(b"user:50")
+
+# Continue iteration from new position
+for key, value in iter:
+    print(f"{key.decode()}={value.decode()}")
+```
+
+## Snapshots
+
+Create consistent, read-only views:
+
+```python
+# Create snapshot
+snap = db.snapshot()
+
+# Mutations after snapshot aren't visible
+db.put(b"key", b"new_value")
+
+# Snapshot sees old state
+value = snap.get(b"key")  # Returns old value or None
+
+# Snapshots support scans
+for key, value in snap.scan_prefix(b"user:"):
+    print(f"{key.decode()}={value.decode()}")
+
+snap.close()
+
+# Async snapshot
+snap = await db.snapshot_async()
+await snap.close_async()
+```
+
+## Transactions
+
+### Snapshot Isolation (SI)
+
+```python
+txn = db.begin("si")
+try:
+    # Read-your-writes
+    txn.put(b"key1", b"value1")
+    value = txn.get(b"key1")  # Sees own write
+    
+    # Scan within transaction
+    for key, value in txn.scan_prefix(b"user:"):
+        print(f"{key.decode()}={value.decode()}")
+    
+    # Commit atomically
+    txn.commit()
+except Exception as e:
+    txn.rollback()
+    raise
+```
+
+### Serializable Snapshot Isolation (SSI)
+
+```python
+txn = db.begin("ssi")  # or "serializable"
+try:
+    txn.put(b"account:1", b"100")
+    txn.put(b"account:2", b"200")
+    txn.commit()
+except Exception as e:
+    txn.rollback()
+    raise
+```
+
+### Transaction Conflicts
+
+```python
+from slatedb import TransactionError
+
+txn1 = db.begin("si")
+txn2 = db.begin("si")
+
+txn1.put(b"key", b"value1")
+txn2.put(b"key", b"value2")
+
+txn1.commit()  # Success
+
+try:
+    txn2.commit()  # Raises TransactionError
+except TransactionError:
+    print("Transaction conflict - retry")
+```
+
+### Async Transactions
+
+```python
+txn = await db.begin_async("si")
+txn.put(b"key", b"value")
+await txn.commit_async()
+```
+
+## Merge Operators
+
+Define custom merge logic:
+
+```python
+# Concatenation merge
+def concat(key: bytes, existing: bytes | None, value: bytes) -> bytes:
+    return (existing or b"") + value
+
+db = SlateDB("/tmp/db", url="memory:///", merge_operator=concat)
+
+db.merge(b"log", b"line1\n")
+db.merge(b"log", b"line2\n")
+
+result = db.get(b"log")
+print(result.decode())  # "line1\nline2\n"
+```
+
+```python
+# Counter merge
+def counter(key: bytes, existing: bytes | None, value: bytes) -> bytes:
+    count = int(existing.decode()) if existing else 0
+    count += int(value.decode())
+    return str(count).encode()
+
+db = SlateDB("/tmp/db", url="memory:///", merge_operator=counter)
+
+db.merge(b"visits", b"1")
+db.merge(b"visits", b"5")
+db.merge(b"visits", b"3")
+
+result = db.get(b"visits")
+print(result.decode())  # "9"
+```
+
+### Merge with Options
+
+```python
+db.merge_with_options(b"key", b"value", ttl=60000)
+
+# In batch
+batch = WriteBatch()
+batch.merge_with_options(b"counter", b"1", ttl=3600000)
+db.write(batch)
+```
+
+## Read-Only Access
+
+### SlateDBReader
+
+```python
+from slatedb import SlateDBReader
+
+# Open read-only reader
+reader = SlateDBReader(
+    "/tmp/db",
+    url="memory:///",
+    manifest_poll_interval=5000,  # 5 seconds
+    checkpoint_lifetime=600000,   # 10 minutes
+)
+
+try:
+    value = reader.get(b"key")
+    
+    for key, value in reader.scan_prefix(b"user:"):
+        print(f"{key.decode()}={value.decode()}")
+finally:
+    reader.close()
+```
+
+### Checkpoint-Pinned Reads
+
+```python
+# Read from specific checkpoint
+reader = SlateDBReader(
+    "/tmp/db",
+    url="memory:///",
+    checkpoint_id="checkpoint-uuid"
+)
+```
+
+## Object Store Configuration
+
+### Using URL
+
+```python
+# Memory
+db = SlateDB("/tmp/db", url="memory:///")
+
+# File system
+db = SlateDB("/tmp/db", url="file:///tmp/slatedb-store")
+
+# S3
+db = SlateDB("/tmp/db", url="s3://my-bucket/prefix")
+```
+
+### Using Environment File
+
+Create `.env` file:
+
+```bash
+# AWS S3
+CLOUD_PROVIDER=aws
+AWS_BUCKET=my-bucket
+AWS_REGION=us-west-2
+
+# Or use direct URL
+SLATEDB_OBJECT_STORE_URL=s3://my-bucket/prefix
+```
+
+Then:
+
+```python
+db = SlateDB("/tmp/db", env_file=".env")
+```
+
+## Read Options
+
+```python
+# Durability filter
+value = db.get_with_options(
+    b"key",
+    durability_filter="remote",  # or "memory"
+    dirty=False
+)
+
+# Scan with options
+for key, value in db.scan_with_options(
+    b"prefix:",
+    durability_filter="memory",
+    dirty=False,
+    read_ahead_bytes=1024 * 1024,
+    cache_blocks=True,
+    max_fetch_tasks=4
+):
+    pass
+```
+
+## Flush Operations
+
+```python
+# Default flush
+db.flush()
+
+# Flush specific target
+db.flush_with_options("wal")       # Flush write-ahead log
+db.flush_with_options("memtable")  # Flush memtable
+
+# Async
+await db.flush_async()
+await db.flush_with_options_async("wal")
+```
+
+## Checkpoints
+
+```python
+# Create checkpoint
+result = db.create_checkpoint(scope="durable")
+print(f"Checkpoint ID: {result['id']}")
+print(f"Manifest ID: {result['manifest_id']}")
+
+# Create with options
+result = db.create_checkpoint(
+    scope="all",
+    lifetime=3600000,  # 1 hour in milliseconds
+    name="my-checkpoint"
+)
+
+# Async
+result = await db.create_checkpoint_async(scope="durable")
+```
+
+## Metrics
+
+```python
+metrics = db.metrics()
+print(f"Get requests: {metrics.get('db/get_requests', 0)}")
+print(f"Scan requests: {metrics.get('db/scan_requests', 0)}")
+print(f"Write ops: {metrics.get('db/write_ops', 0)}")
+```
+
+## Error Handling
+
+```python
+from slatedb import (
+    ClosedError,
+    InvalidError,
+    TransactionError,
+    UnavailableError,
+    DataError,
+    InternalError
+)
+
+try:
+    value = db.get(b"key")
+except ClosedError:
+    print("Database is closed")
+except InvalidError:
+    print("Invalid operation or argument")
+except UnavailableError:
+    print("Object store unavailable")
+except TransactionError:
+    print("Transaction conflict - retry")
+except DataError:
+    print("Data corruption detected")
+except InternalError:
+    print("Internal error")
+```
+
+## Complete Example
+
+```python
+import asyncio
+from slatedb import SlateDB, WriteBatch, TransactionError
+
+async def main():
+    # Open database
+    db = await SlateDB.open_async("/tmp/example", url="memory:///")
+    
+    try:
+        # Write some data
+        await db.put_async(b"user:1", b"Alice")
+        await db.put_async(b"user:2", b"Bob")
+        await db.put_async(b"user:3", b"Charlie")
+        
+        # Batch write
+        batch = WriteBatch()
+        batch.put(b"product:1", b"Laptop")
+        batch.put(b"product:2", b"Mouse")
+        batch.put(b"product:3", b"Keyboard")
+        await db.write_async(batch)
+        
+        # Create snapshot
+        snap = await db.snapshot_async()
+        
+        # Continue writing
+        await db.put_async(b"user:4", b"David")
+        
+        # Snapshot doesn't see new write
+        print("\nUsers in snapshot:")
+        async for key, value in snap.scan_prefix_async(b"user:"):
+            print(f"  {key.decode()} = {value.decode()}")
+        
+        await snap.close_async()
+        
+        # Current view sees all
+        print("\nAll users:")
+        async for key, value in await db.scan_prefix_async(b"user:"):
+            print(f"  {key.decode()} = {value.decode()}")
+        
+        # Transaction example
+        txn = await db.begin_async("si")
+        try:
+            txn.put(b"order:1", b"pending")
+            txn.put(b"order:2", b"shipped")
+            await txn.commit_async()
+        except TransactionError as e:
+            print(f"Transaction failed: {e}")
+            txn.rollback()
+        
+        # Get metrics
+        metrics = db.metrics()
+        print(f"\nMetrics:")
+        print(f"  Get requests: {metrics.get('db/get_requests', 0)}")
+        print(f"  Scan requests: {metrics.get('db/scan_requests', 0)}")
+        
+    finally:
+        await db.close_async()
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+## Thread Safety
+
+All SlateDB Python objects are safe to use from multiple threads. However, for optimal async performance, use the async API methods.

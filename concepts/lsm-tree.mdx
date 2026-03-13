@@ -1,0 +1,455 @@
+---
+title: LSM-Tree Design
+description: Deep dive into SlateDB's log-structured merge-tree implementation on object storage
+---
+
+SlateDB implements a log-structured merge-tree (LSM-tree), a data structure optimized for write-heavy workloads. Unlike traditional B-trees that update data in-place, LSM-trees write all changes sequentially and periodically compact data in the background.
+
+## What is an LSM-Tree?
+
+An LSM-tree consists of multiple levels of sorted data:
+
+1. **Memory Component**: In-memory buffer for fast writes (MemTable)
+2. **Disk Components**: Immutable sorted files on persistent storage (SSTs)
+3. **Compaction Process**: Background merging to reduce data duplication
+
+**Advantages:**
+- Sequential writes (much faster than random writes)
+- High write throughput
+- Efficient compression
+- Simple concurrency model (append-only)
+
+**Trade-offs:**
+- Read amplification (multiple levels to search)
+- Write amplification (data rewritten during compaction)
+- Background compaction overhead
+
+## SlateDB's LSM-Tree Structure
+
+SlateDB organizes data into multiple tiers:
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                       Memory                             │
+│  ┌────────────┐  ┌─────────────────────────────┐       │
+│  │  MemTable  │  │  Immutable MemTables        │       │
+│  │  (Active)  │  │  (Being flushed)            │       │
+│  └────────────┘  └─────────────────────────────┘       │
+└─────────────────────────────────────────────────────────┘
+                           │
+                           │ Flush
+                           ▼
+┌─────────────────────────────────────────────────────────┐
+│                    Object Storage                        │
+│                                                           │
+│  WAL SSTs (Unflushed)                                    │
+│  ┌──────┐ ┌──────┐ ┌──────┐                            │
+│  │ WAL1 │ │ WAL2 │ │ WAL3 │                            │
+│  └──────┘ └──────┘ └──────┘                            │
+│           │                                               │
+│           │ Compact                                       │
+│           ▼                                               │
+│  L0 SSTs (Recently compacted)                            │
+│  ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐                  │
+│  │ L0-1 │ │ L0-2 │ │ L0-3 │ │ L0-4 │                  │
+│  └──────┘ └──────┘ └──────┘ └──────┘                  │
+│           │                                               │
+│           │ Compact                                       │
+│           ▼                                               │
+│  Sorted Runs (SR) - Full keyspace                        │
+│  ┌────────────────────────────────────────────┐         │
+│  │ SR-1: [SST1][SST2][SST3]...[SSTn]        │         │
+│  └────────────────────────────────────────────┘         │
+│  ┌────────────────────────────────────────────┐         │
+│  │ SR-2: [SST1][SST2][SST3]...[SSTm]        │         │
+│  └────────────────────────────────────────────┘         │
+│  ┌────────────────────────────────────────────┐         │
+│  │ SR-3: [SST1][SST2]...[SSTk]              │         │
+│  └────────────────────────────────────────────┘         │
+└─────────────────────────────────────────────────────────┘
+```
+
+### MemTable (L0 Memory)
+
+The **MemTable** is an in-memory sorted map implemented using `crossbeam_skiplist::SkipMap`.
+
+**Structure:**
+```rust
+pub(crate) struct KVTable {
+    map: Arc<SkipMap<SequencedKey, RowEntry>>,
+    entries_size_in_bytes: AtomicUsize,
+    last_tick: AtomicI64,
+    last_seq: AtomicU64,
+    sequence_tracker: Mutex<SequenceTracker>,
+}
+```
+
+**Key features:**
+- Keys stored with sequence numbers for MVCC
+- Concurrent reads and writes
+- Size tracking for flush decisions
+- Timestamp tracking for durability
+
+See: `slatedb/src/mem_table.rs:91-365`
+
+**SequencedKey ordering:**
+
+Keys are sorted first by user key, then by sequence number in **descending** order:
+
+```
+user_key="abc", seq=100  <- Newest
+user_key="abc", seq=50
+user_key="abc", seq=10   <- Oldest
+user_key="xyz", seq=200
+```
+
+This ensures the most recent version appears first during iteration.
+
+See: `slatedb/src/mem_table.rs:36-48`
+
+### WAL SSTs
+
+Before MemTables are flushed to L0, writes are persisted to the **Write-Ahead Log (WAL)** as SSTs.
+
+**Purpose:**
+- Durability before L0 flush completes
+- Fast recovery after crashes
+- Batch writes for efficiency
+
+**WAL Flush Process:**
+
+1. Writes accumulate in WAL buffer
+2. After `flush_interval` or buffer full:
+   - WAL SST written to `/wal/{id}.sst`
+   - Sequence numbers recorded
+3. WAL ID tracked in manifest
+
+See: `slatedb/src/wal_buffer.rs`
+
+**Recovery from WAL:**
+
+On startup, SlateDB:
+
+1. Loads last compacted WAL ID from manifest
+2. Replays all WAL SSTs after that ID
+3. Rebuilds MemTables with replayed data
+4. Resumes normal operation
+
+See: `slatedb/src/db.rs:505-542`
+See RFC: `rfcs/0009-separate-wal.md`
+
+### L0 (Level 0)
+
+L0 contains recently flushed MemTables as immutable SSTs.
+
+**Characteristics:**
+- May have overlapping key ranges
+- Stored in `/compacted/` with ULID names
+- Referenced in manifest `l0` list
+- Compacted by the writer process
+
+**L0 Flush Trigger:**
+
+MemTable is frozen and flushed when:
+- Size exceeds `l0_sst_size_bytes` (default configurable)
+- Or after `l0_manifest_commit_interval_ms`
+
+See: `slatedb/src/db.rs:420-434`
+See RFC: `rfcs/0002-compaction.md:145-198`
+
+### Sorted Runs (L1+)
+
+**Sorted Runs** are compacted representations of the full keyspace.
+
+**Structure:**
+```rust
+pub struct SortedRun {
+    pub id: u32,
+    pub ssts: Vec<SsTableHandle>,
+}
+```
+
+**Properties:**
+- Each SR spans the full keyspace
+- SSTs within an SR are non-overlapping
+- SSTs are range-partitioned for efficient lookups
+- SRs are ordered by age (older = higher ID)
+
+See: `slatedb/src/db_state.rs`
+
+**Example Sorted Run:**
+
+```
+SR-1 (id=1):
+  SST-A: keys [a...d]
+  SST-B: keys [e...m]
+  SST-C: keys [n...z]
+
+SR-2 (id=2):
+  SST-X: keys [a...h]
+  SST-Y: keys [i...z]
+```
+
+To find key `"g"`, search SR-1 first (newest), check index, and read SST-B if present.
+
+## SST File Format
+
+SlateDB's SST format is optimized for object storage:
+
+```
+┌─────────────────────────────────────────────────┐
+│                  SST File                        │
+├─────────────────────────────────────────────────┤
+│  Data Blocks (4KB each, sorted)                 │
+│  ┌──────────────┐                               │
+│  │ Block 0      │  Key-value pairs              │
+│  │ [k1,v1]      │  Compressed                    │
+│  │ [k2,v2]      │  Optional                      │
+│  │ ...          │                                │
+│  ├──────────────┤                               │
+│  │ Block 1      │                               │
+│  │ [k10,v10]    │                               │
+│  │ ...          │                               │
+│  ├──────────────┤                               │
+│  │ Block N      │                               │
+│  │ [k999,v999]  │                               │
+│  └──────────────┘                               │
+├─────────────────────────────────────────────────┤
+│  Bloom Filter (optional)                        │
+│  • Probabilistic set membership                 │
+│  • Reduces negative lookups                     │
+├─────────────────────────────────────────────────┤
+│  Stats Block (optional)                         │
+│  • Min/max keys per SST                         │
+│  • Range metadata                                │
+├─────────────────────────────────────────────────┤
+│  Index Block                                     │
+│  • First key of each block                      │
+│  • Block offsets                                 │
+│  • Used for binary search                       │
+├─────────────────────────────────────────────────┤
+│  Footer                                          │
+│  • Offsets to index, filter, stats              │
+│  • Format version                                │
+│  • Checksum                                      │
+└─────────────────────────────────────────────────┘
+```
+
+See: `slatedb/src/format/sst.rs`
+
+**Block Size:** 4KB by default. Blocks are the unit of:
+- Compression
+- Caching
+- I/O from object storage
+
+**Reading an SST:**
+
+1. Read footer to get index offset
+2. Read and cache index block
+3. Binary search index for key
+4. Read specific data block (or get from cache)
+5. Search within block for exact key
+
+See: `slatedb/src/tablestore.rs:329-336`
+
+## Read Path Detail
+
+### Point Lookups
+
+A `get(key)` operation searches in order:
+
+```rust
+// Simplified read path
+pub async fn get(key: &[u8]) -> Option<Bytes> {
+    // 1. Check MemTable
+    if let Some(value) = self.memtable.get(key) {
+        return Some(value);
+    }
+    
+    // 2. Check Immutable MemTables
+    for imm in &self.imm_memtables {
+        if let Some(value) = imm.get(key) {
+            return Some(value);
+        }
+    }
+    
+    // 3. Check WAL SSTs (if any)
+    for wal_sst in &self.wal_ssts {
+        if bloom_may_contain(wal_sst, key) {
+            if let Some(value) = read_sst(wal_sst, key) {
+                return Some(value);
+            }
+        }
+    }
+    
+    // 4. Check L0 SSTs
+    for l0_sst in &self.l0 {
+        if bloom_may_contain(l0_sst, key) {
+            if let Some(value) = read_sst(l0_sst, key) {
+                return Some(value);
+            }
+        }
+    }
+    
+    // 5. Check Sorted Runs
+    for sr in &self.sorted_runs {
+        if let Some(value) = sr.get(key) {
+            return Some(value);
+        }
+    }
+    
+    None
+}
+```
+
+See: `slatedb/src/db.rs:192-215`
+
+**Optimizations:**
+
+1. **Bloom Filters**: Quickly skip SSTs that definitely don't contain the key
+2. **Block Cache**: Reuse recently read blocks from memory
+3. **Index Cache**: Keep SST indices in memory for fast location
+4. **Short-circuit**: Stop at first found key (newest version wins)
+
+### Range Scans
+
+Range scans use a **merge iterator** that:
+
+1. Creates iterators for each level (MemTable, L0, SRs)
+2. Advances all iterators in parallel
+3. Merges results in sorted order
+4. Deduplicates keys (keeps newest version)
+5. Respects tombstones (deleted keys)
+
+See: `slatedb/src/merge_iterator.rs`
+
+## Write Path Detail
+
+### Write Protocol
+
+```rust
+pub async fn put(key: &[u8], value: &[u8]) -> Result<WriteHandle> {
+    // 1. Assign sequence number
+    let seq = self.next_seq();
+    
+    // 2. Write to MemTable
+    let row = RowEntry::new_value(key, value, seq);
+    self.memtable.put(row);
+    
+    // 3. Write to WAL buffer (async)
+    self.wal_buffer.write(row);
+    
+    // 4. Check if MemTable needs flush
+    if self.memtable.size() >= self.l0_sst_size {
+        self.freeze_memtable();
+    }
+    
+    // 5. Return handle for durability tracking
+    Ok(WriteHandle { seq })
+}
+```
+
+See: `slatedb/src/db.rs:275-307`
+
+### Freeze and Flush
+
+When MemTable fills:
+
+1. **Freeze**: Move active MemTable to immutable queue
+2. **Create New**: Allocate new active MemTable
+3. **Background Flush**: Async task writes immutable to L0
+4. **Manifest Update**: Record new L0 SST via CAS
+5. **Notify Waiters**: Resolve pending write handles
+
+See: `slatedb/src/db.rs:411-434`
+
+## Sequence Numbers
+
+**Sequence numbers** provide MVCC (Multi-Version Concurrency Control):
+
+- Every write gets a monotonically increasing sequence number
+- Readers see a consistent snapshot at a specific sequence
+- Compaction can safely remove old versions
+
+**Usage:**
+
+```rust
+pub struct RowEntry {
+    pub key: Bytes,
+    pub value: Bytes,
+    pub seq: u64,        // Write sequence number
+    pub create_ts: Option<i64>,  // Timestamp
+    pub expire_ts: Option<i64>,  // TTL support
+}
+```
+
+See: `slatedb/src/types.rs`
+
+**Snapshot Isolation:**
+
+```rust
+let snapshot = db.snapshot().await?;
+let value = snapshot.get(b"key").await?; // Sees consistent state
+```
+
+Snapshots freeze the sequence number at creation time, providing isolation from concurrent writes.
+
+See: `slatedb/src/db_snapshot.rs`
+
+## Tombstones
+
+**Tombstones** represent deleted keys:
+
+```rust
+pub enum RowEntry {
+    Value { key, value, seq, ... },
+    Tombstone { key, seq, ... },
+}
+```
+
+During compaction:
+- Tombstones hide older versions of the key
+- Eventually garbage collected when no older versions exist
+- Preserved until `retention_min_seq` to support snapshots
+
+See: `slatedb/src/types.rs`
+
+## Comparison with Traditional LSM-Trees
+
+SlateDB's design differs from disk-based LSM-trees:
+
+| Aspect | Traditional LSM | SlateDB |
+|--------|----------------|----------|
+| Storage | Local disk | Object storage |
+| Write latency | Very low (local) | Higher (network) |
+| Write cost | Disk I/O | API calls (PUT) |
+| Read cost | Disk I/O | API calls (GET) + cache |
+| Durability | fsync() | Object replication |
+| Capacity | Disk size | Unlimited |
+| Concurrency | File locks | CAS on manifest |
+| Distribution | Single machine | Multi-process capable |
+
+**SlateDB optimizations for object storage:**
+
+1. **Batched WAL writes**: Reduce PUT API calls
+2. **Larger SSTs**: Amortize metadata overhead
+3. **Aggressive caching**: Minimize GETs
+4. **Separate write/compact**: Better network utilization
+5. **Sorted Runs**: Keep metadata size manageable
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Architecture" icon="sitemap" href="/concepts/architecture">
+    Understand the overall system architecture
+  </Card>
+  <Card title="Object Storage" icon="cloud" href="/concepts/object-storage">
+    Learn how SlateDB uses object storage
+  </Card>
+  <Card title="Compaction" icon="compress" href="/advanced/compaction">
+    Deep dive into compaction strategies
+  </Card>
+  <Card title="API Reference" icon="code" href="/api/db">
+    Explore the SlateDB API
+  </Card>
+</CardGroup>

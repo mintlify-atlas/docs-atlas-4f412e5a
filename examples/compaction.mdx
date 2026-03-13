@@ -1,0 +1,305 @@
+---
+title: Compaction
+description: Configure and manage compaction in SlateDB for optimal performance
+---
+
+Compaction is the process of merging and reorganizing LSM-tree levels to maintain read performance and reclaim space from deleted keys. SlateDB supports both embedded and standalone compaction.
+
+## Embedded Compaction
+
+By default, SlateDB runs compaction in the same process as your database. This is the simplest setup:
+
+```rust
+use slatedb::object_store::memory::InMemory;
+use slatedb::Db;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let object_store = Arc::new(InMemory::new());
+    
+    // Compaction runs automatically by default
+    let db = Db::open("/tmp/slatedb", object_store).await?;
+    
+    // Write data - compaction happens in the background
+    for i in 0..10000 {
+        db.put(
+            format!("key{}", i).as_bytes(),
+            format!("value{}", i).as_bytes(),
+        ).await?;
+    }
+    
+    db.close().await?;
+    
+    Ok(())
+}
+```
+
+With embedded compaction:
+- Compaction runs automatically in background tasks
+- No additional processes needed
+- Simpler deployment and configuration
+- Resource usage shares the same process
+
+## Standalone Compactor
+
+For production deployments, you can run compaction as a separate process. This provides:
+- Resource isolation
+- Independent scaling
+- Ability to run compaction on different hardware
+- Zero impact on database process during compaction
+
+<Steps>
+  <Step title="Disable embedded compaction">
+    First, configure your database to disable the embedded compactor:
+    
+    ```rust
+    use slatedb::config::Settings;
+    use slatedb::object_store::local::LocalFileSystem;
+    use slatedb::Db;
+    use std::sync::Arc;
+
+    #[tokio::main]
+    async fn main() -> anyhow::Result<()> {
+        // This example uses a local object store so it can be shared with a separate
+        // compactor process. In production, this could also be an object store like S3.
+        let local_root = std::env::temp_dir().join("slatedb-standalone-compactor-tutorial");
+        std::fs::create_dir_all(&local_root)?;
+        let object_store = Arc::new(LocalFileSystem::new_with_prefix(local_root)?);
+
+        // Disable the embedded compactor by clearing compactor options
+        let settings = Settings {
+            compactor_options: None,
+            ..Default::default()
+        };
+
+        let db = Db::builder("db", object_store)
+            .with_settings(settings)
+            .build()
+            .await?;
+
+        db.put(b"hello", b"world").await?;
+        db.flush().await?;
+        db.close().await?;
+
+        Ok(())
+    }
+    ```
+  </Step>
+
+  <Step title="Run the standalone compactor">
+    In a separate process, run the standalone compactor:
+    
+    ```rust
+    use slatedb::object_store::local::LocalFileSystem;
+    use slatedb::CompactorBuilder;
+    use std::sync::Arc;
+
+    #[tokio::main]
+    async fn main() -> anyhow::Result<()> {
+        let local_root = std::env::temp_dir().join("slatedb-standalone-compactor-tutorial");
+        std::fs::create_dir_all(&local_root)?;
+        let object_store = Arc::new(LocalFileSystem::new_with_prefix(local_root)?);
+
+        // Build a compactor without opening a Db. The database must already exist (i.e.
+        // the manifest has been created).
+        let compactor = Arc::new(CompactorBuilder::new("db", object_store).build());
+
+        let compactor_task = {
+            let compactor = Arc::clone(&compactor);
+            tokio::spawn(async move { compactor.run().await })
+        };
+
+        println!("Compactor running. Press Ctrl-C to stop.");
+        tokio::signal::ctrl_c().await?;
+
+        compactor.stop().await?;
+        compactor_task.await??;
+
+        Ok(())
+    }
+    ```
+  </Step>
+
+  <Step title="Deploy and monitor">
+    Deploy the compactor as a separate service. Monitor its progress through logs and metrics.
+  </Step>
+</Steps>
+
+<Warning>
+The database must be created before starting a standalone compactor. The compactor cannot initialize a new database.
+</Warning>
+
+## Production Configuration
+
+Here's a complete production setup with S3:
+
+### Database Process
+
+```rust
+use object_store::aws::S3ConditionalPut;
+use slatedb::config::Settings;
+use slatedb::Db;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let object_store = Arc::new(
+        object_store::aws::AmazonS3Builder::new()
+            .with_bucket_name("my-slatedb-bucket")
+            .with_region("us-east-1")
+            .with_conditional_put(S3ConditionalPut::ETagMatch)
+            .build()?,
+    );
+
+    // Disable embedded compaction for production
+    let settings = Settings {
+        compactor_options: None,
+        ..Default::default()
+    };
+
+    let db = Db::builder("production-db", object_store)
+        .with_settings(settings)
+        .build()
+        .await?;
+
+    // Your application logic here
+    db.put(b"key", b"value").await?;
+
+    db.close().await?;
+
+    Ok(())
+}
+```
+
+### Compactor Process
+
+```rust
+use object_store::aws::S3ConditionalPut;
+use slatedb::CompactorBuilder;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let object_store = Arc::new(
+        object_store::aws::AmazonS3Builder::new()
+            .with_bucket_name("my-slatedb-bucket")
+            .with_region("us-east-1")
+            .with_conditional_put(S3ConditionalPut::ETagMatch)
+            .build()?,
+    );
+
+    let compactor = Arc::new(
+        CompactorBuilder::new("production-db", object_store).build()
+    );
+
+    let compactor_task = {
+        let compactor = Arc::clone(&compactor);
+        tokio::spawn(async move { compactor.run().await })
+    };
+
+    println!("Production compactor running. Press Ctrl-C to stop.");
+    tokio::signal::ctrl_c().await?;
+
+    println!("Shutting down compactor...");
+    compactor.stop().await?;
+    compactor_task.await??;
+
+    Ok(())
+}
+```
+
+## Compaction Strategy
+
+SlateDB uses a leveled compaction strategy:
+
+1. **L0**: New writes are flushed to L0 SSTables
+2. **L1-L6**: Data is compacted into progressively larger levels
+3. **Merging**: Overlapping SSTables are merged, and deleted keys are removed
+4. **Size limits**: Each level has a size limit that triggers compaction to the next level
+
+### When Compaction Happens
+
+Compaction is triggered when:
+- L0 has too many SSTables (default: 8)
+- A level exceeds its size limit
+- Manual compaction is requested
+
+## Monitoring Compaction
+
+Monitor compaction through logging:
+
+```rust
+use slatedb::object_store::memory::InMemory;
+use slatedb::Db;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    // Initialize tracing subscriber for logging
+    tracing_subscriber::fmt::init();
+
+    let object_store = Arc::new(InMemory::new());
+    let db = Db::open("/tmp/slatedb", object_store).await?;
+
+    // Watch logs for compaction activity
+    for i in 0..100000 {
+        db.put(
+            format!("key{}", i).as_bytes(),
+            format!("value{}", i).as_bytes(),
+        ).await?;
+    }
+
+    db.close().await?;
+
+    Ok(())
+}
+```
+
+Look for log messages about:
+- Compaction jobs starting
+- SSTables being merged
+- Level sizes changing
+- Compaction completion
+
+## Comparison: Embedded vs Standalone
+
+| Feature | Embedded | Standalone |
+|---------|----------|------------|
+| **Setup** | Simple | Requires separate process |
+| **Resource isolation** | No | Yes |
+| **Scaling** | Scales with DB | Independent scaling |
+| **Latency impact** | Possible during heavy compaction | None |
+| **Deployment** | Single process | Multiple processes |
+| **Use case** | Development, small deployments | Production, large scale |
+
+## Best Practices
+
+<AccordionGroup>
+  <Accordion title="When to use embedded compaction">
+    - Development and testing
+    - Small to medium workloads
+    - Simple deployments
+    - When resource isolation isn't critical
+  </Accordion>
+
+  <Accordion title="When to use standalone compaction">
+    - Production deployments
+    - High-throughput workloads
+    - When read latency must be consistent
+    - When you need to scale compaction independently
+  </Accordion>
+
+  <Accordion title="Monitoring tips">
+    - Watch L0 SSTable count (high count = compaction falling behind)
+    - Monitor compaction lag
+    - Track object store bandwidth usage
+    - Set up alerts for compaction failures
+  </Accordion>
+</AccordionGroup>
+
+## Next Steps
+
+- Learn about [snapshots](/examples/snapshots) for consistent reads
+- Review [configuration options](/configuration) for tuning compaction
+- Explore [object store configuration](/examples/object-stores) for production

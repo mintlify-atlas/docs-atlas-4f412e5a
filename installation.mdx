@@ -1,0 +1,388 @@
+---
+title: Installation
+description: Install SlateDB for your programming language
+---
+
+SlateDB is available for multiple programming languages with official bindings for Rust, Go, Java, and Python. Choose your language below for installation instructions.
+
+## Rust
+
+SlateDB is natively written in Rust and provides the most direct integration.
+
+<Steps>
+  <Step title="Add to Cargo.toml">
+    Add SlateDB to your project's `Cargo.toml`:
+
+    ```toml Cargo.toml
+    [dependencies]
+    slatedb = "0.11.1"
+    tokio = { version = "1", features = ["full"] }
+    ```
+
+    The `tokio` dependency is required since SlateDB uses async/await.
+  </Step>
+
+  <Step title="Import in Your Code">
+    ```rust
+    use slatedb::{Db, Error};
+    use slatedb::object_store::memory::InMemory;
+    use std::sync::Arc;
+    ```
+  </Step>
+
+  <Step title="Verify Installation">
+    Build your project to verify the installation:
+
+    ```bash
+    cargo build
+    ```
+  </Step>
+</Steps>
+
+### Object Store Dependencies
+
+SlateDB uses the `object_store` crate for object storage integration. The crate is re-exported by SlateDB for convenience. For production use with cloud providers, you may need additional features:
+
+```toml Cargo.toml
+[dependencies]
+slatedb = "0.11.1"
+object_store = { version = "0.12", features = ["aws", "gcp", "azure"] }
+tokio = { version = "1", features = ["full"] }
+```
+
+<Note>
+The latest version is `0.11.1`. Check [crates.io](https://crates.io/crates/slatedb) for the most recent version.
+</Note>
+
+## Python
+
+SlateDB Python bindings provide both synchronous and asynchronous APIs.
+
+<Steps>
+  <Step title="Install with pip">
+    ```bash
+    pip install slatedb
+    ```
+
+    Or with a specific version:
+
+    ```bash
+    pip install slatedb==0.11.1
+    ```
+  </Step>
+
+  <Step title="Verify Installation">
+    ```bash
+    python -c "import slatedb; print(slatedb.__version__)"
+    ```
+  </Step>
+
+  <Step title="Import in Your Code">
+    ```python
+    from slatedb import SlateDB, SlateDBReader, WriteBatch
+    ```
+  </Step>
+</Steps>
+
+### Requirements
+
+- **Python Version**: 3.10 or higher
+- **Platforms**: Pre-built wheels are available for:
+  - Linux (x86_64, aarch64)
+  - macOS (x86_64, aarch64)
+  - Windows (x86_64, aarch64)
+
+### Development Setup
+
+If you're contributing to SlateDB Python bindings or building from source:
+
+```bash
+# Install uv (Python package manager)
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Create virtual environment
+uv venv
+
+# Install dependencies
+uv pip install -e .[test]
+
+# Install Maturin (Rust-Python build tool)
+uv tool install maturin
+
+# Build the project
+uv run maturin develop
+```
+
+## Go
+
+SlateDB Go bindings use CGO to call the `slatedb-c` FFI library.
+
+<Steps>
+  <Step title="Prerequisites">
+    Ensure you have:
+    - Go 1.25 or higher
+    - CGO enabled
+    - C toolchain (`cc`)
+    - Rust toolchain (to build `slatedb-c`)
+  </Step>
+
+  <Step title="Build slatedb-c">
+    From the SlateDB repository root:
+
+    ```bash
+    cargo build -p slatedb-c --release
+    ```
+
+    This creates the native library in `target/release/`.
+  </Step>
+
+  <Step title="Set Library Path">
+    Set the runtime library path so the Go binary can find `libslatedb_c`:
+
+    ```bash
+    # macOS
+    export DYLD_LIBRARY_PATH="$(pwd)/target/debug:$(pwd)/target/release"
+
+    # Linux
+    export LD_LIBRARY_PATH="$(pwd)/target/debug:$(pwd)/target/release"
+    ```
+
+    <Note>
+    You'll need to set this environment variable every time you run your Go application, or add it to your shell profile.
+    </Note>
+  </Step>
+
+  <Step title="Install Go Module">
+    ```bash
+    cd slatedb-go/go
+    go build
+    go test ./...
+    ```
+
+    Or in your own project:
+
+    ```bash
+    go get slatedb.io/slatedb-go
+    ```
+  </Step>
+
+  <Step title="Import in Your Code">
+    ```go
+    import (
+        "slatedb.io/slatedb-go"
+    )
+    ```
+  </Step>
+</Steps>
+
+### Object Store Configuration
+
+Go bindings support multiple ways to configure object storage:
+
+1. **Direct URL** (recommended):
+   ```go
+   db, err := slatedb.Open(
+       "/tmp/cache",
+       slatedb.WithUrl[slatedb.DbConfig]("memory:///"),
+   )
+   ```
+
+2. **Environment Variables**:
+   ```bash
+   export SLATEDB_OBJECT_STORE_URL="s3://my-bucket/"
+   # or
+   export OBJECT_STORE_URL="file:///tmp/slatedb"
+   ```
+
+3. **Provider-specific Config** (via `.env` file):
+   ```bash
+   CLOUD_PROVIDER=aws
+   AWS_BUCKET=my-slate-bucket
+   AWS_REGION=us-west-2
+   ```
+
+## Java
+
+SlateDB Java bindings use the Java Foreign Function and Memory (FFM) API introduced in Java 24.
+
+<Steps>
+  <Step title="Requirements">
+    - **Java Version**: Java 24 or higher (required for FFM API)
+    - **Build Tool**: Maven or Gradle
+  </Step>
+
+  <Step title="Add Dependency">
+    <Tabs>
+      <Tab title="Maven">
+        Add to your `pom.xml`:
+
+        ```xml pom.xml
+        <dependency>
+          <groupId>io.slatedb</groupId>
+          <artifactId>slatedb</artifactId>
+          <version>0.11.1</version>
+        </dependency>
+        ```
+      </Tab>
+
+      <Tab title="Gradle">
+        Add to your `build.gradle`:
+
+        ```groovy build.gradle
+        implementation "io.slatedb:slatedb:0.11.1"
+        ```
+
+        Or in Kotlin DSL (`build.gradle.kts`):
+
+        ```kotlin build.gradle.kts
+        implementation("io.slatedb:slatedb:0.11.1")
+        ```
+      </Tab>
+    </Tabs>
+  </Step>
+
+  <Step title="Import in Your Code">
+    ```java
+    import io.slatedb.SlateDb;
+    import io.slatedb.SlateDbConfig;
+    import io.slatedb.SlateDbWriteBatch;
+    import io.slatedb.SlateDbScanIterator;
+    ```
+  </Step>
+
+  <Step title="Enable Native Access">
+    When running your application, you must enable native access:
+
+    ```bash
+    java --enable-native-access=ALL-UNNAMED -cp your-app.jar YourMainClass
+    ```
+
+    Or in your IDE's run configuration, add this VM option:
+    ```
+    --enable-native-access=ALL-UNNAMED
+    ```
+  </Step>
+</Steps>
+
+### Supported Platforms
+
+The Maven Central release includes pre-built native libraries for:
+
+- Linux (x86_64, aarch64)
+- macOS (x86_64, aarch64)  
+- Windows (x86_64, aarch64)
+
+The native library is automatically extracted from the JAR at runtime - no additional setup required.
+
+### Building from Source
+
+To build the Java bindings locally:
+
+```bash
+# From repository root
+cd slatedb-java
+./gradlew jar
+
+# Run tests
+./gradlew test
+```
+
+The JAR is written to `slatedb-java/build/libs/slatedb-<version>.jar`.
+
+## Community Bindings
+
+In addition to official bindings, SlateDB has community-maintained bindings for:
+
+<CardGroup cols={2}>
+  <Card title=".NET" icon="code" href="https://github.com/Pulsy-Global/slatedb-dotnet">
+    Community-maintained .NET bindings
+  </Card>
+  <Card title="Ruby" icon="gem" href="https://github.com/catkins/slatedb-rb">
+    Community-maintained Ruby bindings
+  </Card>
+  <Card title="TypeScript" icon="code" href="https://github.com/gadget-inc/slatedb-node">
+    Community-maintained Node.js/TypeScript bindings
+  </Card>
+</CardGroup>
+
+## Verifying Installation
+
+To verify your installation is working, try running one of the examples from the [Quickstart](/quickstart) guide. Each language has a simple "Hello World" example that tests basic functionality.
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="Rust: Cannot find crate slatedb">
+    Make sure you've added the dependency to `Cargo.toml` and run `cargo build`. Check that you're using a compatible Rust version (see `rust-toolchain.toml` in the repository).
+  </Accordion>
+
+  <Accordion title="Python: ModuleNotFoundError">
+    Ensure you're using Python 3.10 or higher:
+    ```bash
+    python --version
+    ```
+
+    If you're using a virtual environment, make sure it's activated before installing SlateDB.
+  </Accordion>
+
+  <Accordion title="Go: UnsatisfiedLinkError or library not found">
+    The most common issue is that the `libslatedb_c` library cannot be found at runtime. Make sure:
+
+    1. You've built `slatedb-c` with `cargo build -p slatedb-c`
+    2. You've set `LD_LIBRARY_PATH` (Linux) or `DYLD_LIBRARY_PATH` (macOS)
+    3. The path includes both `target/debug` and `target/release`
+
+    ```bash
+    # From repository root
+    export LD_LIBRARY_PATH="$(pwd)/target/debug:$(pwd)/target/release"
+    ```
+  </Accordion>
+
+  <Accordion title="Java: UnsatisfiedLinkError">
+    If you get an `UnsatisfiedLinkError`, it usually means:
+
+    1. You're not using Java 24 or higher
+    2. The JAR doesn't contain a native library for your platform
+    3. You forgot to add `--enable-native-access=ALL-UNNAMED`
+
+    Verify your Java version:
+    ```bash
+    java -version
+    ```
+
+    Make sure you're using a release JAR from Maven Central, which includes all platforms.
+  </Accordion>
+
+  <Accordion title="Object store connection issues">
+    If you're having trouble connecting to object storage:
+
+    1. Start with the in-memory store (`memory:///`) to verify SlateDB itself works
+    2. Check that your credentials are properly configured (AWS credentials, GCS service account, etc.)
+    3. Verify network connectivity to your object store
+    4. Check the object store URL format matches your provider
+
+    For AWS S3:
+    ```bash
+    export AWS_ACCESS_KEY_ID=your-key
+    export AWS_SECRET_ACCESS_KEY=your-secret
+    export AWS_REGION=us-east-1
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="bolt" href="/quickstart">
+    Build your first SlateDB application
+  </Card>
+  <Card title="Configuration" icon="gear" href="/configuration">
+    Learn how to configure SlateDB
+  </Card>
+  <Card title="Object Storage Setup" icon="cloud" href="/configuration/object-stores">
+    Configure different object storage backends
+  </Card>
+  <Card title="API Reference" icon="book" href="/api/db">
+    Explore the complete API documentation
+  </Card>
+</CardGroup>

@@ -1,0 +1,613 @@
+---
+title: 'Db'
+description: 'Main database interface for read and write operations'
+---
+
+The `Db` struct represents a SlateDB database instance and provides methods for reading and writing data.
+
+## Opening a Database
+
+### open
+
+```rust
+pub async fn open<P: Into<Path>>(
+    path: P,
+    object_store: Arc<dyn ObjectStore>,
+) -> Result<Self, Error>
+```
+
+Open a new database with default options.
+
+<ParamField path="path" type="P: Into<Path>" required>
+  The path to the database in object storage
+</ParamField>
+
+<ParamField path="object_store" type="Arc<dyn ObjectStore>" required>
+  The object store implementation to use for persistence
+</ParamField>
+
+<ResponseField name="Result" type="Result<Db, Error>">
+  Returns a `Db` instance on success, or an error if the database could not be opened
+</ResponseField>
+
+```rust
+use slatedb::{Db, Error};
+use slatedb::object_store::memory::InMemory;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    let object_store = Arc::new(InMemory::new());
+    let db = Db::open("test_db", object_store).await?;
+    Ok(())
+}
+```
+
+### builder
+
+```rust
+pub fn builder<P: Into<Path>>(
+    path: P,
+    object_store: Arc<dyn ObjectStore>,
+) -> DbBuilder<P>
+```
+
+Creates a new builder for configuring and opening a database.
+
+<ParamField path="path" type="P: Into<Path>" required>
+  The path to the database
+</ParamField>
+
+<ParamField path="object_store" type="Arc<dyn ObjectStore>" required>
+  The object store to use for the database
+</ParamField>
+
+<ResponseField name="DbBuilder" type="DbBuilder<P>">
+  Returns a builder that can be configured before opening the database
+</ResponseField>
+
+```rust
+use slatedb::{Db, Error};
+use slatedb::object_store::memory::InMemory;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    let object_store = Arc::new(InMemory::new());
+    let db = Db::builder("/tmp/test_db", object_store)
+        .build()
+        .await?;
+    Ok(())
+}
+```
+
+## Read Operations
+
+### get
+
+```rust
+pub async fn get<K: AsRef<[u8]> + Send>(
+    &self,
+    key: K,
+) -> Result<Option<Bytes>, Error>
+```
+
+Get a value from the database with default read options.
+
+<ParamField path="key" type="K: AsRef<[u8]> + Send" required>
+  The key to retrieve
+</ParamField>
+
+<ResponseField name="Result" type="Result<Option<Bytes>, Error>">
+  Returns `Some(Bytes)` if the key exists, `None` if it doesn't, or an error
+</ResponseField>
+
+```rust
+let value = db.get(b"key").await?;
+assert_eq!(value, Some("value".into()));
+```
+
+### get_with_options
+
+```rust
+pub async fn get_with_options<K: AsRef<[u8]> + Send>(
+    &self,
+    key: K,
+    options: &ReadOptions,
+) -> Result<Option<Bytes>, Error>
+```
+
+Get a value from the database with custom read options.
+
+<ParamField path="key" type="K: AsRef<[u8]> + Send" required>
+  The key to retrieve
+</ParamField>
+
+<ParamField path="options" type="&ReadOptions" required>
+  Read options to customize the operation
+</ParamField>
+
+<ResponseField name="Result" type="Result<Option<Bytes>, Error>">
+  Returns `Some(Bytes)` if the key exists, `None` if it doesn't, or an error
+</ResponseField>
+
+```rust
+use slatedb::config::ReadOptions;
+
+let value = db.get_with_options(b"key", &ReadOptions::default()).await?;
+```
+
+### get_key_value
+
+```rust
+pub async fn get_key_value<K: AsRef<[u8]> + Send>(
+    &self,
+    key: K,
+) -> Result<Option<KeyValue>, Error>
+```
+
+Get a key-value pair with metadata from the database.
+
+<ParamField path="key" type="K: AsRef<[u8]> + Send" required>
+  The key to look up
+</ParamField>
+
+<ResponseField name="Result" type="Result<Option<KeyValue>, Error>">
+  Returns `Some(KeyValue)` with key, value, and metadata if the key exists
+</ResponseField>
+
+### get_key_value_with_options
+
+```rust
+pub async fn get_key_value_with_options<K: AsRef<[u8]> + Send>(
+    &self,
+    key: K,
+    options: &ReadOptions,
+) -> Result<Option<KeyValue>, Error>
+```
+
+Get a key-value pair with metadata using custom read options.
+
+<ParamField path="key" type="K: AsRef<[u8]> + Send" required>
+  The key to look up
+</ParamField>
+
+<ParamField path="options" type="&ReadOptions" required>
+  Read options to customize the operation
+</ParamField>
+
+<ResponseField name="Result" type="Result<Option<KeyValue>, Error>">
+  Returns `Some(KeyValue)` with key, value, sequence number, and timestamps
+</ResponseField>
+
+## Scan Operations
+
+### scan
+
+```rust
+pub async fn scan<K, T>(&self, range: T) -> Result<DbIterator, Error>
+where
+    K: AsRef<[u8]> + Send,
+    T: RangeBounds<K> + Send,
+```
+
+Scan a range of keys using default scan options.
+
+<ParamField path="range" type="T: RangeBounds<K>" required>
+  The range of keys to scan (e.g., `"a".."z"` or `..`)
+</ParamField>
+
+<ResponseField name="Result" type="Result<DbIterator, Error>">
+  Returns a `DbIterator` for iterating over the key-value pairs in the range
+</ResponseField>
+
+```rust
+db.put(b"a", b"a_value").await?;
+db.put(b"b", b"b_value").await?;
+
+let mut iter = db.scan("a".."b").await?;
+let kv = iter.next().await?.unwrap();
+assert_eq!(kv.key.as_ref(), b"a");
+assert_eq!(kv.value.as_ref(), b"a_value");
+```
+
+### scan_with_options
+
+```rust
+pub async fn scan_with_options<K, T>(
+    &self,
+    range: T,
+    options: &ScanOptions,
+) -> Result<DbIterator, Error>
+where
+    K: AsRef<[u8]> + Send,
+    T: RangeBounds<K> + Send,
+```
+
+Scan a range of keys with custom options.
+
+<ParamField path="range" type="T: RangeBounds<K>" required>
+  The range of keys to scan
+</ParamField>
+
+<ParamField path="options" type="&ScanOptions" required>
+  Scan options to customize the operation
+</ParamField>
+
+<ResponseField name="Result" type="Result<DbIterator, Error>">
+  Returns a `DbIterator` for iterating over the results
+</ResponseField>
+
+### scan_prefix
+
+```rust
+pub async fn scan_prefix<P>(&self, prefix: P) -> Result<DbIterator, Error>
+where
+    P: AsRef<[u8]> + Send,
+```
+
+Scan all keys that share a common prefix.
+
+<ParamField path="prefix" type="P: AsRef<[u8]>" required>
+  The key prefix to scan
+</ParamField>
+
+<ResponseField name="Result" type="Result<DbIterator, Error>">
+  Returns a `DbIterator` for all keys with the specified prefix
+</ResponseField>
+
+```rust
+db.put(b"ab", b"v0").await?;
+db.put(b"aba", b"v1").await?;
+db.put(b"b", b"v2").await?;
+
+let mut iter = db.scan_prefix(b"ab").await?;
+let kv = iter.next().await?.unwrap();
+assert_eq!(kv.key.as_ref(), b"ab");
+```
+
+### scan_prefix_with_options
+
+```rust
+pub async fn scan_prefix_with_options<P>(
+    &self,
+    prefix: P,
+    options: &ScanOptions,
+) -> Result<DbIterator, Error>
+where
+    P: AsRef<[u8]> + Send,
+```
+
+Scan all keys with a prefix using custom options.
+
+<ParamField path="prefix" type="P: AsRef<[u8]>" required>
+  The key prefix to scan
+</ParamField>
+
+<ParamField path="options" type="&ScanOptions" required>
+  Scan options to customize the operation
+</ParamField>
+
+<ResponseField name="Result" type="Result<DbIterator, Error>">
+  Returns a `DbIterator` for the scan results
+</ResponseField>
+
+## Write Operations
+
+### put
+
+```rust
+pub async fn put<K, V>(&self, key: K, value: V) -> Result<WriteHandle, Error>
+where
+    K: AsRef<[u8]>,
+    V: AsRef<[u8]>,
+```
+
+Write a key-value pair with default write options.
+
+<ParamField path="key" type="K: AsRef<[u8]>" required>
+  The key to write
+</ParamField>
+
+<ParamField path="value" type="V: AsRef<[u8]>" required>
+  The value to write
+</ParamField>
+
+<ResponseField name="Result" type="Result<WriteHandle, Error>">
+  Returns a `WriteHandle` containing the sequence number and timestamp
+</ResponseField>
+
+```rust
+let handle = db.put(b"key", b"value").await?;
+```
+
+### put_with_options
+
+```rust
+pub async fn put_with_options<K, V>(
+    &self,
+    key: K,
+    value: V,
+    put_opts: &PutOptions,
+    write_opts: &WriteOptions,
+) -> Result<WriteHandle, Error>
+where
+    K: AsRef<[u8]>,
+    V: AsRef<[u8]>,
+```
+
+Write a key-value pair with custom put and write options.
+
+<ParamField path="key" type="K: AsRef<[u8]>" required>
+  The key to write
+</ParamField>
+
+<ParamField path="value" type="V: AsRef<[u8]>" required>
+  The value to write
+</ParamField>
+
+<ParamField path="put_opts" type="&PutOptions" required>
+  Options for the put operation (e.g., TTL)
+</ParamField>
+
+<ParamField path="write_opts" type="&WriteOptions" required>
+  Options for the write operation (e.g., durability)
+</ParamField>
+
+<ResponseField name="Result" type="Result<WriteHandle, Error>">
+  Returns a `WriteHandle` on success
+</ResponseField>
+
+### delete
+
+```rust
+pub async fn delete<K: AsRef<[u8]>>(&self, key: K) -> Result<WriteHandle, Error>
+```
+
+Delete a key with default write options.
+
+<ParamField path="key" type="K: AsRef<[u8]>" required>
+  The key to delete
+</ParamField>
+
+<ResponseField name="Result" type="Result<WriteHandle, Error>">
+  Returns a `WriteHandle` on success
+</ResponseField>
+
+### delete_with_options
+
+```rust
+pub async fn delete_with_options<K: AsRef<[u8]>>(
+    &self,
+    key: K,
+    options: &WriteOptions,
+) -> Result<WriteHandle, Error>
+```
+
+Delete a key with custom write options.
+
+<ParamField path="key" type="K: AsRef<[u8]>" required>
+  The key to delete
+</ParamField>
+
+<ParamField path="options" type="&WriteOptions" required>
+  Write options to customize the operation
+</ParamField>
+
+<ResponseField name="Result" type="Result<WriteHandle, Error>">
+  Returns a `WriteHandle` on success
+</ResponseField>
+
+### merge
+
+```rust
+pub async fn merge<K, V>(&self, key: K, value: V) -> Result<WriteHandle, Error>
+where
+    K: AsRef<[u8]>,
+    V: AsRef<[u8]>,
+```
+
+Merge a value into a key using the configured merge operator.
+
+<ParamField path="key" type="K: AsRef<[u8]>" required>
+  The key to merge into
+</ParamField>
+
+<ParamField path="value" type="V: AsRef<[u8]>" required>
+  The merge operand to apply
+</ParamField>
+
+<ResponseField name="Result" type="Result<WriteHandle, Error>">
+  Returns a `WriteHandle` on success, or an error if no merge operator is configured
+</ResponseField>
+
+### merge_with_options
+
+```rust
+pub async fn merge_with_options<K, V>(
+    &self,
+    key: K,
+    value: V,
+    merge_opts: &MergeOptions,
+    write_opts: &WriteOptions,
+) -> Result<WriteHandle, Error>
+where
+    K: AsRef<[u8]>,
+    V: AsRef<[u8]>,
+```
+
+Merge a value with custom options.
+
+<ParamField path="key" type="K: AsRef<[u8]>" required>
+  The key to merge into
+</ParamField>
+
+<ParamField path="value" type="V: AsRef<[u8]>" required>
+  The merge operand
+</ParamField>
+
+<ParamField path="merge_opts" type="&MergeOptions" required>
+  Options for the merge operation
+</ParamField>
+
+<ParamField path="write_opts" type="&WriteOptions" required>
+  Options for the write operation
+</ParamField>
+
+<ResponseField name="Result" type="Result<WriteHandle, Error>">
+  Returns a `WriteHandle` on success
+</ResponseField>
+
+### write
+
+```rust
+pub async fn write(&self, batch: WriteBatch) -> Result<WriteHandle, Error>
+```
+
+Write a batch of operations atomically.
+
+<ParamField path="batch" type="WriteBatch" required>
+  The batch of put/delete/merge operations to write
+</ParamField>
+
+<ResponseField name="Result" type="Result<WriteHandle, Error>">
+  Returns a `WriteHandle` on success
+</ResponseField>
+
+```rust
+use slatedb::WriteBatch;
+
+let mut batch = WriteBatch::new();
+batch.put(b"key1", b"value1");
+batch.put(b"key2", b"value2");
+batch.delete(b"key3");
+let handle = db.write(batch).await?;
+```
+
+### write_with_options
+
+```rust
+pub async fn write_with_options(
+    &self,
+    batch: WriteBatch,
+    options: &WriteOptions,
+) -> Result<WriteHandle, Error>
+```
+
+Write a batch with custom write options.
+
+<ParamField path="batch" type="WriteBatch" required>
+  The batch of operations
+</ParamField>
+
+<ParamField path="options" type="&WriteOptions" required>
+  Write options to customize the operation
+</ParamField>
+
+<ResponseField name="Result" type="Result<WriteHandle, Error>">
+  Returns a `WriteHandle` on success
+</ResponseField>
+
+## Flush Operations
+
+### flush
+
+```rust
+pub async fn flush(&self) -> Result<(), Error>
+```
+
+Flush in-memory writes to durable storage. Blocks until data is persisted.
+
+<ResponseField name="Result" type="Result<(), Error>">
+  Returns `Ok(())` on success, or an error if the flush failed
+</ResponseField>
+
+```rust
+db.put(b"key", b"value").await?;
+db.flush().await?;
+```
+
+### flush_with_options
+
+```rust
+pub async fn flush_with_options(&self, options: FlushOptions) -> Result<(), Error>
+```
+
+Flush with custom options to control whether to flush WAL or memtable.
+
+<ParamField path="options" type="FlushOptions" required>
+  Options controlling which components to flush
+</ParamField>
+
+<ResponseField name="Result" type="Result<(), Error>">
+  Returns `Ok(())` on success
+</ResponseField>
+
+## Snapshot and Transaction Operations
+
+### snapshot
+
+```rust
+pub async fn snapshot(&self) -> Result<Arc<DbSnapshot>, Error>
+```
+
+Create a read-only snapshot of the database.
+
+<ResponseField name="Result" type="Result<Arc<DbSnapshot>, Error>">
+  Returns a `DbSnapshot` representing a consistent view of the database
+</ResponseField>
+
+```rust
+db.put(b"key1", b"value1").await?;
+let snapshot = db.snapshot().await?;
+
+// Snapshot provides read-only access
+let value = snapshot.get(b"key1").await?;
+assert_eq!(value, Some(Bytes::from("value1")));
+
+// Further writes don't affect the snapshot
+db.put(b"key2", b"value2").await?;
+assert_eq!(snapshot.get(b"key2").await?, None);
+```
+
+### begin
+
+```rust
+pub async fn begin(&self, isolation_level: IsolationLevel) -> Result<DbTransaction, Error>
+```
+
+Begin a new transaction with the specified isolation level.
+
+<ParamField path="isolation_level" type="IsolationLevel" required>
+  The isolation level (`Snapshot` or `SerializableSnapshot`)
+</ParamField>
+
+<ResponseField name="Result" type="Result<DbTransaction, Error>">
+  Returns a `DbTransaction` for performing transactional operations
+</ResponseField>
+
+```rust
+use slatedb::IsolationLevel;
+
+let txn = db.begin(IsolationLevel::Snapshot).await?;
+txn.put(b"key", b"value")?;
+txn.commit().await?;
+```
+
+## Database Management
+
+### close
+
+```rust
+pub async fn close(&self) -> Result<(), Error>
+```
+
+Close the database, flushing outstanding writes and shutting down background tasks.
+
+<ResponseField name="Result" type="Result<(), Error>">
+  Returns `Ok(())` on success, or an error if the database is already closed
+</ResponseField>
+
+```rust
+db.close().await?;
+```

@@ -1,0 +1,101 @@
+---
+title: 'WriteHandle'
+description: 'Handle returned from write operations containing metadata'
+---
+
+The `WriteHandle` struct is returned from all write operations (`put`, `delete`, `merge`, `write`) and contains metadata about the write.
+
+## Structure
+
+```rust
+pub struct WriteHandle {
+    pub(crate) seq: u64,
+    pub(crate) create_ts: i64,
+}
+```
+
+## Methods
+
+### seqnum
+
+```rust
+pub fn seqnum(&self) -> u64
+```
+
+Returns the sequence number assigned to the write operation.
+
+<ResponseField name="u64" type="u64">
+  The sequence number of this write in the database's commit history
+</ResponseField>
+
+```rust
+let handle = db.put(b"key", b"value").await?;
+let seq = handle.seqnum();
+println!("Write assigned sequence number: {}", seq);
+```
+
+<Info>
+Sequence numbers are monotonically increasing and can be used to determine the order of writes.
+</Info>
+
+### create_ts
+
+```rust
+pub fn create_ts(&self) -> i64
+```
+
+Returns the creation timestamp assigned to the write operation.
+
+<ResponseField name="i64" type="i64">
+  The Unix timestamp (in milliseconds) when the write was created
+</ResponseField>
+
+```rust
+let handle = db.put(b"key", b"value").await?;
+let ts = handle.create_ts();
+println!("Write created at: {}", ts);
+```
+
+## Usage Example
+
+```rust
+use slatedb::{Db, Error};
+use slatedb::object_store::memory::InMemory;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    let object_store = Arc::new(InMemory::new());
+    let db = Db::open("test_db", object_store).await?;
+
+    // Perform a write and get the handle
+    let handle = db.put(b"key", b"value").await?;
+    
+    // Access metadata from the handle
+    println!("Sequence number: {}", handle.seqnum());
+    println!("Creation timestamp: {}", handle.create_ts());
+    
+    // Use sequence number for ordering or tracking
+    let seq = handle.seqnum();
+    
+    Ok(())
+}
+```
+
+## Tracking Write Progress
+
+The `WriteHandle` can be used to track when writes are applied and understand the order of operations:
+
+```rust
+// Perform multiple writes
+let handle1 = db.put(b"key1", b"value1").await?;
+let handle2 = db.put(b"key2", b"value2").await?;
+let handle3 = db.delete(b"key1").await?;
+
+// Verify ordering
+assert!(handle1.seqnum() < handle2.seqnum());
+assert!(handle2.seqnum() < handle3.seqnum());
+
+// The delete of key1 has a higher sequence number
+// than the put, so it will be visible
+```

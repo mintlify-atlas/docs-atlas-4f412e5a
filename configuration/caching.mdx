@@ -1,0 +1,460 @@
+---
+title: Caching
+description: Configure local disk and memory caching for improved performance
+---
+
+SlateDB provides two types of caching to improve performance and reduce object storage costs:
+
+1. **Disk Cache**: Caches object storage data on local disk
+2. **Memory Cache**: Caches SSTable blocks, indices, and filters in memory
+
+Both types of caching are optional but highly recommended for production workloads.
+
+## Disk Cache (Object Store Cache)
+
+The disk cache stores object storage data locally to reduce GET requests and improve read latency. When enabled, SlateDB creates a local cache on the file system that mirrors object storage content.
+
+### Configuration
+
+Disk caching is configured through `ObjectStoreCacheOptions`:
+
+```rust
+use slatedb::config::{Settings, ObjectStoreCacheOptions};
+use std::path::PathBuf;
+use std::time::Duration;
+
+let mut settings = Settings::default();
+settings.object_store_cache_options = ObjectStoreCacheOptions {
+    root_folder: Some(PathBuf::from("/var/cache/slatedb")),
+    max_cache_size_bytes: Some(16 * 1024 * 1024 * 1024),  // 16 GB
+    part_size_bytes: 4 * 1024 * 1024,                     // 4 MB
+    cache_puts: false,
+    preload_disk_cache_on_startup: None,
+    scan_interval: Some(Duration::from_secs(3600)),       // 1 hour
+};
+```
+
+### Configuration Options
+
+<ParamField path="root_folder" type="Option<PathBuf>" default="None">
+  The root folder where cache files are stored. If not set, disk caching is disabled.
+
+  ```rust
+  cache_options.root_folder = Some(PathBuf::from("/var/cache/slatedb"));
+  ```
+
+  **Considerations:**
+  - Use fast local storage (SSD/NVMe) for best performance
+  - Ensure the directory is writable by the SlateDB process
+  - Consider using ephemeral storage in containerized environments
+</ParamField>
+
+<ParamField path="max_cache_size_bytes" type="Option<usize>" default="16 GiB (64-bit) / 4 GiB (32-bit)">
+  The maximum cache size in bytes. When the cache exceeds this size, older entries are evicted.
+
+  ```rust
+  cache_options.max_cache_size_bytes = Some(16 * 1024 * 1024 * 1024); // 16 GB
+  ```
+
+  **Recommendations:**
+  - Set to 20-50% of available disk space
+  - Larger caches improve hit rates but use more disk
+  - Consider your working set size when sizing the cache
+</ParamField>
+
+<ParamField path="part_size_bytes" type="usize" default="4194304 (4 MiB)">
+  The size of each cache part file. Must be aligned to 1KB.
+
+  ```rust
+  cache_options.part_size_bytes = 4 * 1024 * 1024; // 4 MB
+  ```
+
+  **Considerations:**
+  - Larger parts reduce metadata overhead but may waste cache space
+  - Smaller parts provide finer granularity but increase file count
+  - Recommended range: 1 MiB to 8 MiB
+  - Must be a multiple of 1024 bytes
+</ParamField>
+
+<ParamField path="cache_puts" type="bool" default="false">
+  Whether to cache PUT operations to disk. When enabled, data written via PUT operations is cached locally for faster subsequent reads.
+
+  ```rust
+  cache_options.cache_puts = true;
+  ```
+
+  **Considerations:**
+  - Useful when written data is frequently read back
+  - Increases write latency slightly due to local caching overhead
+  - Benefits workloads with temporal locality in writes
+</ParamField>
+
+<ParamField path="preload_disk_cache_on_startup" type="Option<PreloadLevel>" default="None">
+  Whether to preload SST files into cache during database startup. Available options:
+  
+  - `None`: No preloading (default)
+  - `PreloadLevel::L0Sst`: Preload only L0 SSTs (most recently written files)
+  - `PreloadLevel::AllSst`: Preload all SSTs (L0 and compacted)
+
+  ```rust
+  use slatedb::config::PreloadLevel;
+  
+  cache_options.preload_disk_cache_on_startup = Some(PreloadLevel::L0Sst);
+  ```
+
+  **Considerations:**
+  - Preloading increases startup time but improves initial read performance
+  - `L0Sst` provides good balance between startup time and cache warmth
+  - `AllSst` can take significant time for large databases
+  - Only preloads up to `max_cache_size_bytes`
+</ParamField>
+
+<ParamField path="scan_interval" type="Option<Duration>" default="Some(3600s)">
+  Interval to scan the cache directory to rebuild the in-memory eviction map. Set to `None` to scan only once on startup.
+
+  ```rust
+  cache_options.scan_interval = Some(Duration::from_secs(3600)); // 1 hour
+  ```
+
+  **Considerations:**
+  - Periodic scans ensure cache consistency after crashes or external modifications
+  - More frequent scans provide better consistency but use more I/O
+  - Set to `None` for read-only workloads or when cache consistency isn't critical
+</ParamField>
+
+## Memory Cache (Block Cache)
+
+The memory cache stores SSTable blocks, indices, bloom filters, and statistics in memory to avoid disk and network I/O. SlateDB uses a split cache architecture with separate caches for data blocks and metadata.
+
+### Configuration
+
+Memory caching is configured through the `DbBuilder`:
+
+```rust
+use slatedb::Db;
+use slatedb::db_cache::{DbCache, SplitCache};
+use std::sync::Arc;
+
+// Using the default cache
+let db = Db::builder("/path/to/db", object_store)
+    .build()
+    .await?;
+
+// Using a custom cache
+use slatedb::db_cache::foyer::{FoyerCache, FoyerCacheOptions};
+
+let block_cache = Arc::new(FoyerCache::new_with_opts(FoyerCacheOptions {
+    max_capacity: 512 * 1024 * 1024,  // 512 MB for blocks
+    ..Default::default()
+}));
+
+let meta_cache = Arc::new(FoyerCache::new_with_opts(FoyerCacheOptions {
+    max_capacity: 128 * 1024 * 1024,  // 128 MB for metadata
+    ..Default::default()
+}));
+
+let cache = Arc::new(
+    SplitCache::new()
+        .with_block_cache(Some(block_cache))
+        .with_meta_cache(Some(meta_cache))
+        .build()
+);
+
+let db = Db::builder("/path/to/db", object_store)
+    .with_db_cache(cache)
+    .build()
+    .await?;
+```
+
+### Built-in Cache Implementations
+
+SlateDB provides two built-in cache implementations:
+
+#### Foyer Cache (Default)
+
+An efficient in-memory cache with LRU eviction. Requires the `foyer` feature (enabled by default).
+
+```rust
+use slatedb::db_cache::foyer::{FoyerCache, FoyerCacheOptions};
+use std::sync::Arc;
+
+let cache = Arc::new(FoyerCache::new_with_opts(FoyerCacheOptions {
+    max_capacity: 512 * 1024 * 1024,  // 512 MB
+    ..Default::default()
+}));
+```
+
+<ParamField path="max_capacity" type="u64" default="536870912 (512 MiB)">
+  Maximum memory capacity in bytes for the cache.
+</ParamField>
+
+#### Moka Cache
+
+A high-performance concurrent caching library. Requires the `moka` feature flag.
+
+```rust
+use slatedb::db_cache::moka::{MokaCache, MokaCacheOptions};
+use std::sync::Arc;
+use std::time::Duration;
+
+let cache = Arc::new(MokaCache::new_with_opts(MokaCacheOptions {
+    max_capacity: 512 * 1024 * 1024,      // 512 MB
+    time_to_live: Some(Duration::from_secs(3600)),
+    time_to_idle: Some(Duration::from_secs(600)),
+}));
+```
+
+<ParamField path="max_capacity" type="u64">
+  Maximum memory capacity in bytes.
+</ParamField>
+
+<ParamField path="time_to_live" type="Option<Duration>" default="None">
+  Time-to-live for cache entries. Entries are evicted after this duration since insertion.
+</ParamField>
+
+<ParamField path="time_to_idle" type="Option<Duration>" default="None">
+  Time-to-idle for cache entries. Entries are evicted after this duration of inactivity.
+</ParamField>
+
+### Split Cache Architecture
+
+SlateDB uses a split cache with separate caches for different data types:
+
+```rust
+use slatedb::db_cache::SplitCache;
+use std::sync::Arc;
+
+let cache = SplitCache::new()
+    .with_block_cache(Some(block_cache_impl))  // For SSTable data blocks
+    .with_meta_cache(Some(meta_cache_impl))    // For indices, filters, stats
+    .build();
+```
+
+**Benefits:**
+- Independent sizing for data vs. metadata
+- Prevents metadata eviction by large data scans
+- Better cache efficiency through specialized eviction policies
+
+### Custom Cache Implementation
+
+You can implement your own cache by implementing the `DbCache` trait:
+
+```rust
+use slatedb::db_cache::{DbCache, CachedKey, CachedEntry};
+use async_trait::async_trait;
+use std::sync::Arc;
+
+struct MyCache {
+    // your implementation
+}
+
+#[async_trait]
+impl DbCache for MyCache {
+    async fn get_block(&self, key: &CachedKey) -> Result<Option<CachedEntry>, slatedb::Error> {
+        // Implement block retrieval
+        Ok(None)
+    }
+
+    async fn get_index(&self, key: &CachedKey) -> Result<Option<CachedEntry>, slatedb::Error> {
+        // Implement index retrieval
+        Ok(None)
+    }
+
+    async fn get_filter(&self, key: &CachedKey) -> Result<Option<CachedEntry>, slatedb::Error> {
+        // Implement filter retrieval
+        Ok(None)
+    }
+
+    async fn get_stats(&self, key: &CachedKey) -> Result<Option<CachedEntry>, slatedb::Error> {
+        // Implement stats retrieval
+        Ok(None)
+    }
+
+    async fn insert(&self, key: CachedKey, value: CachedEntry) {
+        // Implement insertion
+    }
+
+    async fn remove(&self, key: &CachedKey) {
+        // Implement removal
+    }
+
+    fn entry_count(&self) -> u64 {
+        // Return entry count
+        0
+    }
+}
+
+let db = Db::builder("/path/to/db", object_store)
+    .with_db_cache(Arc::new(MyCache { /* ... */ }))
+    .build()
+    .await?;
+```
+
+## Configuration Examples
+
+### Production Configuration
+
+Balanced configuration for production workloads:
+
+```rust
+use slatedb::config::{Settings, ObjectStoreCacheOptions, PreloadLevel};
+use slatedb::db_cache::{SplitCache, foyer::{FoyerCache, FoyerCacheOptions}};
+use std::path::PathBuf;
+use std::time::Duration;
+use std::sync::Arc;
+
+// Disk cache configuration
+let mut settings = Settings::default();
+settings.object_store_cache_options = ObjectStoreCacheOptions {
+    root_folder: Some(PathBuf::from("/var/cache/slatedb")),
+    max_cache_size_bytes: Some(32 * 1024 * 1024 * 1024),  // 32 GB
+    part_size_bytes: 4 * 1024 * 1024,
+    cache_puts: false,
+    preload_disk_cache_on_startup: Some(PreloadLevel::L0Sst),
+    scan_interval: Some(Duration::from_secs(3600)),
+};
+
+// Memory cache configuration
+let block_cache = Arc::new(FoyerCache::new_with_opts(FoyerCacheOptions {
+    max_capacity: 1024 * 1024 * 1024,  // 1 GB
+    ..Default::default()
+}));
+
+let meta_cache = Arc::new(FoyerCache::new_with_opts(FoyerCacheOptions {
+    max_capacity: 256 * 1024 * 1024,  // 256 MB
+    ..Default::default()
+}));
+
+let memory_cache = Arc::new(
+    SplitCache::new()
+        .with_block_cache(Some(block_cache))
+        .with_meta_cache(Some(meta_cache))
+        .build()
+);
+
+let db = Db::builder("/path/to/db", object_store)
+    .with_settings(settings)
+    .with_db_cache(memory_cache)
+    .build()
+    .await?;
+```
+
+### High-Performance Configuration
+
+Maximum caching for high-performance workloads:
+
+```rust
+use slatedb::config::{Settings, ObjectStoreCacheOptions, PreloadLevel};
+use slatedb::db_cache::{SplitCache, foyer::{FoyerCache, FoyerCacheOptions}};
+use std::path::PathBuf;
+use std::time::Duration;
+use std::sync::Arc;
+
+let mut settings = Settings::default();
+settings.object_store_cache_options = ObjectStoreCacheOptions {
+    root_folder: Some(PathBuf::from("/nvme/slatedb-cache")),
+    max_cache_size_bytes: Some(100 * 1024 * 1024 * 1024),  // 100 GB on NVMe
+    part_size_bytes: 8 * 1024 * 1024,
+    cache_puts: true,
+    preload_disk_cache_on_startup: Some(PreloadLevel::AllSst),
+    scan_interval: Some(Duration::from_secs(1800)),
+};
+
+let block_cache = Arc::new(FoyerCache::new_with_opts(FoyerCacheOptions {
+    max_capacity: 4 * 1024 * 1024 * 1024,  // 4 GB
+    ..Default::default()
+}));
+
+let meta_cache = Arc::new(FoyerCache::new_with_opts(FoyerCacheOptions {
+    max_capacity: 512 * 1024 * 1024,  // 512 MB
+    ..Default::default()
+}));
+
+let memory_cache = Arc::new(
+    SplitCache::new()
+        .with_block_cache(Some(block_cache))
+        .with_meta_cache(Some(meta_cache))
+        .build()
+);
+```
+
+### Minimal Configuration
+
+Minimal caching for resource-constrained environments:
+
+```rust
+use slatedb::config::{Settings, ObjectStoreCacheOptions};
+use slatedb::db_cache::{SplitCache, foyer::{FoyerCache, FoyerCacheOptions}};
+use std::sync::Arc;
+
+let mut settings = Settings::default();
+settings.object_store_cache_options = ObjectStoreCacheOptions {
+    root_folder: None,  // Disable disk cache
+    ..Default::default()
+};
+
+let meta_cache = Arc::new(FoyerCache::new_with_opts(FoyerCacheOptions {
+    max_capacity: 64 * 1024 * 1024,  // 64 MB for metadata only
+    ..Default::default()
+}));
+
+let memory_cache = Arc::new(
+    SplitCache::new()
+        .with_meta_cache(Some(meta_cache))  // Only cache metadata
+        .build()
+);
+```
+
+## Monitoring Cache Performance
+
+SlateDB provides metrics to monitor cache effectiveness:
+
+### Memory Cache Metrics
+
+- `dbcache.data_block_hit`: Data block cache hits
+- `dbcache.data_block_miss`: Data block cache misses
+- `dbcache.index_hit`: Index cache hits
+- `dbcache.index_miss`: Index cache misses
+- `dbcache.filter_hit`: Bloom filter cache hits
+- `dbcache.filter_miss`: Bloom filter cache misses
+- `dbcache.stats_hit`: Statistics cache hits
+- `dbcache.stats_miss`: Statistics cache misses
+- `dbcache.get_error`: Cache retrieval errors
+
+### Disk Cache Metrics
+
+- `object_store_cache.part_hits`: Number of cache part hits
+- `object_store_cache.part_access`: Number of cache part accesses
+
+Calculate hit rate: `hits / (hits + misses)`
+
+See the [Metrics documentation](/api/db) for details on accessing these metrics.
+
+## Best Practices
+
+<Tip>
+  Size caches based on your working set and access patterns. Monitor hit rates and adjust accordingly.
+</Tip>
+
+1. **Disk Cache:**
+   - Use fast local storage (SSD/NVMe)
+   - Set `max_cache_size_bytes` to 20-50% of available disk
+   - Enable preloading for predictable read patterns
+   - Consider `cache_puts` for write-then-read workloads
+
+2. **Memory Cache:**
+   - Allocate 10-20% of available memory
+   - Use split cache for better isolation
+   - Monitor hit rates and adjust sizes
+   - Metadata cache is typically 20-30% the size of block cache
+
+3. **Combined Strategy:**
+   - Use both disk and memory caching for best performance
+   - Memory cache provides fastest access (µs latency)
+   - Disk cache reduces object storage costs and provides ms latency
+   - Tune based on your latency and cost requirements
+
+4. **Cache Sizing:**
+   - Start conservative and increase based on hit rates
+   - Monitor eviction rates to detect cache pressure
+   - Balance between cache size and other memory needs

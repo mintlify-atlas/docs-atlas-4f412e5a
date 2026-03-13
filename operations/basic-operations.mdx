@@ -1,0 +1,249 @@
+---
+title: Basic Operations
+description: Learn how to perform basic read and write operations in SlateDB
+---
+
+SlateDB provides a simple key-value interface for reading and writing data. This guide covers the fundamental operations you'll use most frequently.
+
+## Opening a Database
+
+Before performing any operations, you need to open a database connection:
+
+```rust
+use slatedb::Db;
+use slatedb::object_store::memory::InMemory;
+use std::sync::Arc;
+
+let object_store = Arc::new(InMemory::new());
+let db = Db::open("my_db", object_store).await?;
+```
+
+## Writing Data
+
+### Put Operation
+
+Write a key-value pair to the database:
+
+```rust
+// Simple put
+let handle = db.put(b"user:1", b"alice").await?;
+```
+
+The `put` operation returns a `WriteHandle` that you can use to track the write.
+
+### Put with Options
+
+Customize write behavior with `PutOptions` and `WriteOptions`:
+
+```rust
+use slatedb::config::{PutOptions, WriteOptions};
+
+let handle = db.put_with_options(
+    b"user:1",
+    b"alice",
+    &PutOptions::default(),
+    &WriteOptions {
+        await_durable: true,  // Wait for write to be persisted
+    }
+).await?;
+```
+
+<Note>
+  Setting `await_durable: true` ensures the write is persisted to object storage before returning, providing stronger durability guarantees.
+</Note>
+
+### Batch Writes
+
+Write multiple operations atomically using `WriteBatch`:
+
+```rust
+use slatedb::WriteBatch;
+
+let mut batch = WriteBatch::new();
+batch.put(b"user:1", b"alice");
+batch.put(b"user:2", b"bob");
+batch.delete(b"user:3");
+
+let handle = db.write(batch).await?;
+```
+
+<Note>
+  Batch writes are atomic - either all operations succeed or none do. The batch blocks other operations until written to the WAL or memtable.
+</Note>
+
+## Reading Data
+
+### Get Operation
+
+Retrieve a value by its key:
+
+```rust
+let value = db.get(b"user:1").await?;
+match value {
+    Some(bytes) => println!("Found: {:?}", bytes),
+    None => println!("Key not found"),
+}
+```
+
+### Get with Options
+
+Control read behavior with `ReadOptions`:
+
+```rust
+use slatedb::config::{ReadOptions, DurabilityLevel};
+
+let options = ReadOptions::new()
+    .with_durability_filter(DurabilityLevel::Remote);
+    
+let value = db.get_with_options(b"user:1", &options).await?;
+```
+
+<Note>
+  `DurabilityLevel::Remote` only reads data that has been persisted to object storage, while `DurabilityLevel::Memory` includes data still in memory.
+</Note>
+
+### Get Key-Value with Metadata
+
+Retrieve the full row entry including metadata:
+
+```rust
+let kv = db.get_key_value(b"user:1").await?;
+if let Some(entry) = kv {
+    println!("Key: {:?}", entry.key);
+    println!("Value: {:?}", entry.value);
+    println!("Sequence: {}", entry.seq);
+    println!("Create time: {:?}", entry.create_ts);
+    println!("Expire time: {:?}", entry.expire_ts);
+}
+```
+
+## Deleting Data
+
+### Delete Operation
+
+Remove a key from the database:
+
+```rust
+let handle = db.delete(b"user:1").await?;
+```
+
+### Delete with Options
+
+```rust
+use slatedb::config::WriteOptions;
+
+let handle = db.delete_with_options(
+    b"user:1",
+    &WriteOptions::default()
+).await?;
+```
+
+<Note>
+  Delete operations create tombstones that mark keys as deleted. These tombstones are eventually removed during compaction.
+</Note>
+
+## Flushing Data
+
+Flush in-memory writes to durable storage:
+
+```rust
+// Flush using default options (WAL if enabled, otherwise memtable)
+db.flush().await?;
+```
+
+Flush with specific options:
+
+```rust
+use slatedb::config::{FlushOptions, FlushType};
+
+// Force flush memtables to SSTs
+db.flush_with_options(FlushOptions {
+    flush_type: FlushType::MemTable,
+}).await?;
+
+// Flush WAL only
+db.flush_with_options(FlushOptions {
+    flush_type: FlushType::Wal,
+}).await?;
+```
+
+## Error Handling
+
+All operations return `Result<T, Error>`. Handle errors appropriately:
+
+```rust
+use slatedb::Error;
+
+match db.get(b"key").await {
+    Ok(Some(value)) => println!("Value: {:?}", value),
+    Ok(None) => println!("Key not found"),
+    Err(e) => eprintln!("Error: {}", e),
+}
+```
+
+Common errors include:
+- Database closed
+- I/O errors
+- Fenced operations (concurrent writers)
+- Invalid operations (e.g., empty batches)
+
+## Closing the Database
+
+Always close the database when done:
+
+```rust
+db.close().await?;
+```
+
+<Note>
+  Closing the database flushes outstanding writes and shuts down background tasks. Don't reuse a closed database connection.
+</Note>
+
+## Complete Example
+
+```rust
+use slatedb::{Db, Error};
+use slatedb::object_store::memory::InMemory;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    // Open database
+    let object_store = Arc::new(InMemory::new());
+    let db = Db::open("my_app", object_store).await?;
+    
+    // Write data
+    db.put(b"user:alice", b"alice@example.com").await?;
+    db.put(b"user:bob", b"bob@example.com").await?;
+    
+    // Read data
+    let email = db.get(b"user:alice").await?;
+    println!("Alice's email: {:?}", email);
+    
+    // Delete data
+    db.delete(b"user:bob").await?;
+    
+    // Verify deletion
+    let deleted = db.get(b"user:bob").await?;
+    assert!(deleted.is_none());
+    
+    // Flush to storage
+    db.flush().await?;
+    
+    // Close database
+    db.close().await?;
+    
+    Ok(())
+}
+```
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Scanning" icon="binoculars" href="/operations/scanning">
+    Learn how to iterate over ranges of keys
+  </Card>
+  <Card title="Transactions" icon="arrows-rotate" href="/operations/transactions">
+    Use ACID transactions for complex operations
+  </Card>
+</CardGroup>

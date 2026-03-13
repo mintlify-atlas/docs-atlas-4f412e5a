@@ -1,0 +1,558 @@
+---
+title: Error Handling
+description: API reference for SlateDB error types and error handling strategies
+---
+
+## Overview
+
+SlateDB provides a two-tier error system:
+
+1. **Internal errors** (`SlateDBError`): Detailed error types used internally
+2. **Public errors** (`Error`): User-facing errors with prescriptive error kinds
+
+The public `Error` type provides a clear contract for applications to handle different error scenarios.
+
+## Error Type
+
+```rust
+pub struct Error {
+    msg: String,
+    kind: ErrorKind,
+    source: Option<BoxError>,
+}
+```
+
+<ResponseField name="msg" type="String">
+  Human-readable error message describing what went wrong.
+</ResponseField>
+
+<ResponseField name="kind" type="ErrorKind">
+  The category of error, indicating how the application should respond.
+</ResponseField>
+
+<ResponseField name="source" type="Option<BoxError>">
+  Optional underlying error that caused this error.
+</ResponseField>
+
+## ErrorKind
+
+The `ErrorKind` enum categorizes errors by how applications should respond:
+
+```rust
+pub enum ErrorKind {
+    Transaction,
+    Closed(CloseReason),
+    Unavailable,
+    Invalid,
+    Data,
+    Internal,
+}
+```
+
+### Transaction
+
+A transaction conflict occurred. The transaction must be retried or dropped.
+
+```rust
+ErrorKind::Transaction
+```
+
+**Typical causes:**
+- Concurrent modification of the same key
+- Transaction validation failure
+
+**How to handle:**
+- Retry the transaction with exponential backoff
+- Abort the transaction and return an error to the user
+
+#### Example
+
+```rust
+match db.transaction(|txn| {
+    // Transaction logic
+}).await {
+    Err(e) if e.kind() == ErrorKind::Transaction => {
+        // Retry logic
+        retry_transaction().await
+    }
+    Err(e) => return Err(e),
+    Ok(result) => result,
+}
+```
+
+### Closed
+
+The database has been shutdown. The instance is no longer usable.
+
+```rust
+ErrorKind::Closed(CloseReason)
+```
+
+<ResponseField name="CloseReason" type="enum">
+  Indicates why the database was closed:
+  
+  - `CloseReason::Clean` - Normal shutdown
+  - `CloseReason::Fenced` - Fenced by another instance
+  - `CloseReason::Panic` - Background task panicked
+</ResponseField>
+
+**How to handle:**
+- Gracefully shutdown the application or service
+- Create a new database instance if appropriate
+- Log the reason for monitoring and debugging
+
+#### Example
+
+```rust
+match db.put(b"key", b"value").await {
+    Err(e) if matches!(e.kind(), ErrorKind::Closed(_)) => {
+        log::error!("Database closed: {}", e);
+        // Attempt reconnect or shutdown
+    }
+    Err(e) => return Err(e),
+    Ok(_) => {},
+}
+```
+
+### Unavailable
+
+A storage or network service is unavailable.
+
+```rust
+ErrorKind::Unavailable
+```
+
+**Typical causes:**
+- Network connectivity issues
+- Object storage service downtime
+- I/O errors
+
+**How to handle:**
+- Retry with exponential backoff
+- Circuit breaker pattern for repeated failures
+- Return service unavailable to callers
+
+#### Example
+
+```rust
+use tokio::time::{sleep, Duration};
+
+let mut retries = 0;
+let max_retries = 3;
+
+loop {
+    match db.get(b"key").await {
+        Err(e) if e.kind() == ErrorKind::Unavailable && retries < max_retries => {
+            retries += 1;
+            let backoff = Duration::from_millis(100 * 2_u64.pow(retries));
+            sleep(backoff).await;
+            continue;
+        }
+        result => break result,
+    }
+}
+```
+
+### Invalid
+
+User attempted an invalid request.
+
+```rust
+ErrorKind::Invalid
+```
+
+**Typical causes:**
+- Invalid configuration on initialization
+- Invalid argument to a method
+- Invalid method call sequence
+- User-supplied plugin failure (compaction scheduler, merge operator, etc.)
+
+**How to handle:**
+- Return validation error to the user
+- Log the error for debugging
+- Fix the code, configuration, or argument
+
+#### Example
+
+```rust
+use slatedb::config::Settings;
+
+match Settings::from_file("invalid_config.toml") {
+    Err(e) if e.kind() == ErrorKind::Invalid => {
+        eprintln!("Invalid configuration: {}", e);
+        std::process::exit(1);
+    }
+    Err(e) => return Err(e),
+    Ok(settings) => settings,
+}
+```
+
+### Data
+
+Persisted data is in an unexpected state.
+
+```rust
+ErrorKind::Data
+```
+
+**Typical causes:**
+- Data corruption (temporary or permanent)
+- Incompatible file format versions
+- Object storage eventual consistency issues
+- Missing expected files
+
+**How to handle:**
+- Retry the operation (may resolve eventual consistency issues)
+- Use a compatible client version
+- Restore from backup if data is corrupted
+- Report the error if it persists
+
+#### Example
+
+```rust
+match db.get(b"key").await {
+    Err(e) if e.kind() == ErrorKind::Data => {
+        log::error!("Data error: {}", e);
+        // Attempt recovery or restore from backup
+        restore_from_checkpoint().await?;
+    }
+    Err(e) => return Err(e),
+    Ok(value) => value,
+}
+```
+
+### Internal
+
+An unexpected internal error occurred.
+
+```rust
+ErrorKind::Internal
+```
+
+**Typical causes:**
+- Internal assertion failures
+- Unexpected state transitions
+- Programming errors in SlateDB
+
+**How to handle:**
+- Log the full error with stack trace
+- Report the issue on [GitHub](https://github.com/slatedb/slatedb/issues/new?template=bug_report.md&title=Internal+error+returned)
+- Attempt recovery or restart
+
+<Warning>
+Users should not expect to see internal errors. If you encounter one, please report it as a bug.
+</Warning>
+
+#### Example
+
+```rust
+match db.operation().await {
+    Err(e) if e.kind() == ErrorKind::Internal => {
+        log::error!("Internal error: {:?}", e);
+        // Report to error tracking service
+        report_internal_error(&e);
+        // Attempt recovery
+    }
+    result => result,
+}
+```
+
+## Error Methods
+
+### kind()
+
+Returns the error kind.
+
+```rust
+pub fn kind(&self) -> ErrorKind
+```
+
+#### Example
+
+```rust
+if error.kind() == ErrorKind::Unavailable {
+    // Handle unavailable error
+}
+```
+
+### source()
+
+Returns the underlying source error, if any.
+
+```rust
+pub fn source(&self) -> Option<&(dyn std::error::Error + 'static)>
+```
+
+#### Example
+
+```rust
+if let Some(source) = error.source() {
+    log::debug!("Caused by: {}", source);
+}
+```
+
+## Common Error Patterns
+
+### Retry with Backoff
+
+```rust
+use tokio::time::{sleep, Duration};
+
+async fn retry_with_backoff<F, T>(
+    mut operation: F,
+    max_retries: u32,
+) -> Result<T, Error>
+where
+    F: FnMut() -> futures::future::BoxFuture<'static, Result<T, Error>>,
+{
+    let mut retries = 0;
+    
+    loop {
+        match operation().await {
+            Ok(result) => return Ok(result),
+            Err(e) if e.kind() == ErrorKind::Unavailable && retries < max_retries => {
+                retries += 1;
+                let backoff = Duration::from_millis(100 * 2_u64.pow(retries));
+                sleep(backoff).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+```
+
+### Circuit Breaker
+
+```rust
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
+
+struct CircuitBreaker {
+    failures: Arc<AtomicU32>,
+    threshold: u32,
+}
+
+impl CircuitBreaker {
+    fn new(threshold: u32) -> Self {
+        Self {
+            failures: Arc::new(AtomicU32::new(0)),
+            threshold,
+        }
+    }
+    
+    fn is_open(&self) -> bool {
+        self.failures.load(Ordering::Relaxed) >= self.threshold
+    }
+    
+    fn record_success(&self) {
+        self.failures.store(0, Ordering::Relaxed);
+    }
+    
+    fn record_failure(&self) {
+        self.failures.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+async fn call_with_circuit_breaker<T>(
+    circuit_breaker: &CircuitBreaker,
+    operation: impl Future<Output = Result<T, Error>>,
+) -> Result<T, Error> {
+    if circuit_breaker.is_open() {
+        return Err(Error::unavailable("Circuit breaker open".to_string()));
+    }
+    
+    match operation.await {
+        Ok(result) => {
+            circuit_breaker.record_success();
+            Ok(result)
+        }
+        Err(e) if e.kind() == ErrorKind::Unavailable => {
+            circuit_breaker.record_failure();
+            Err(e)
+        }
+        Err(e) => Err(e),
+    }
+}
+```
+
+### Graceful Degradation
+
+```rust
+async fn get_with_fallback(
+    db: &Db,
+    key: &[u8],
+    fallback_value: Bytes,
+) -> Result<Bytes, Error> {
+    match db.get(key).await {
+        Ok(Some(value)) => Ok(value),
+        Ok(None) => Ok(fallback_value),
+        Err(e) if e.kind() == ErrorKind::Unavailable => {
+            log::warn!("DB unavailable, using fallback: {}", e);
+            Ok(fallback_value)
+        }
+        Err(e) => Err(e),
+    }
+}
+```
+
+### Error Context
+
+```rust
+fn add_context<T>(
+    result: Result<T, Error>,
+    context: &str,
+) -> Result<T, Error> {
+    result.map_err(|e| {
+        Error::from(e).with_source(
+            format!("Context: {}", context).into()
+        )
+    })
+}
+
+// Usage
+let result = db.get(b"key")
+    .await
+    .map_err(|e| add_context(Err(e), "fetching user profile"))?;
+```
+
+## Specific Errors
+
+### Not Found
+
+When a key doesn't exist, `get()` returns `Ok(None)` rather than an error:
+
+```rust
+match db.get(b"key").await? {
+    Some(value) => println!("Found: {:?}", value),
+    None => println!("Key not found"),
+}
+```
+
+Object store "not found" errors are mapped to `ErrorKind::Data`.
+
+### Fencing
+
+When a database instance is fenced by another instance:
+
+```rust
+match db.put(b"key", b"value").await {
+    Err(e) if e.kind() == ErrorKind::Closed(CloseReason::Fenced) => {
+        log::error!("Database fenced by another instance");
+        // Shutdown or create new instance
+    }
+    result => result,
+}
+```
+
+### Merge Operator Missing
+
+Attempting to read merge operands without a configured merge operator:
+
+```rust
+// If merge operator is not configured
+match db.get(b"merge_key").await {
+    Err(e) if e.kind() == ErrorKind::Invalid => {
+        // Likely missing merge operator
+        log::error!("Error reading merge key: {}", e);
+    }
+    result => result,
+}
+```
+
+### Checksum Mismatch
+
+Data corruption detected during read:
+
+```rust
+match db.get(b"key").await {
+    Err(e) if e.kind() == ErrorKind::Data => {
+        if e.to_string().contains("checksum") {
+            log::error!("Data corruption detected");
+            // Attempt recovery from backup
+        }
+    }
+    result => result,
+}
+```
+
+## Best Practices
+
+### Always Check Error Kind
+
+Don't just log errors - handle them appropriately based on their kind:
+
+```rust
+// Bad
+db.put(b"key", b"value").await.unwrap();
+
+// Good
+match db.put(b"key", b"value").await {
+    Ok(_) => {},
+    Err(e) => match e.kind() {
+        ErrorKind::Unavailable => retry_later(),
+        ErrorKind::Closed(_) => shutdown(),
+        ErrorKind::Invalid => log_validation_error(&e),
+        _ => return Err(e),
+    }
+}
+```
+
+### Preserve Error Context
+
+Add context to errors as they propagate:
+
+```rust
+db.get(b"user:123")
+    .await
+    .map_err(|e| {
+        log::error!("Failed to fetch user 123: {}", e);
+        e
+    })?
+```
+
+### Monitor Error Rates
+
+Track error kinds in metrics to identify systemic issues:
+
+```rust
+match db.operation().await {
+    Err(e) => {
+        metrics::increment_counter!("db_errors", "kind" => e.kind().to_string());
+        Err(e)
+    }
+    Ok(result) => Ok(result),
+}
+```
+
+### Don't Swallow Errors
+
+Always propagate or log errors - silent failures are hard to debug:
+
+```rust
+// Bad
+let _ = db.put(b"key", b"value").await;
+
+// Good
+if let Err(e) = db.put(b"key", b"value").await {
+    log::error!("Failed to write key: {}", e);
+    // Handle or propagate
+}
+```
+
+### Test Error Paths
+
+Write tests that verify error handling behavior:
+
+```rust
+#[tokio::test]
+async fn test_handles_unavailable_error() {
+    let db = create_failing_db();
+    
+    match db.get(b"key").await {
+        Err(e) if e.kind() == ErrorKind::Unavailable => {
+            // Expected
+        }
+        other => panic!("Expected Unavailable error, got: {:?}", other),
+    }
+}
+```

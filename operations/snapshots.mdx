@@ -1,0 +1,381 @@
+---
+title: Snapshots
+description: Create consistent point-in-time views of your SlateDB database
+---
+
+Snapshots provide read-only, consistent views of the database at a specific point in time. They're perfect for long-running reads, backups, or analytical queries that need a stable view of your data.
+
+## Creating Snapshots
+
+Create a snapshot with a single method call:
+
+```rust
+let snapshot = db.snapshot().await?;
+```
+
+The snapshot captures the database state at the moment it's created.
+
+<Note>
+  Snapshots are lightweight - they don't copy data, they just track a sequence number for reads.
+</Note>
+
+## Reading from Snapshots
+
+### Get Operations
+
+Read values from the snapshot:
+
+```rust
+let snapshot = db.snapshot().await?;
+
+// Simple get
+let value = snapshot.get(b"user:1").await?;
+
+// Get with options
+let value = snapshot.get_with_options(b"user:1", &ReadOptions::default()).await?;
+
+// Get key-value with metadata
+let kv = snapshot.get_key_value(b"user:1").await?;
+```
+
+### Scanning
+
+Iterate over ranges in the snapshot:
+
+```rust
+let snapshot = db.snapshot().await?;
+
+let mut iter = snapshot.scan(b"user:"..).await?;
+while let Some(kv) = iter.next().await? {
+    println!("Key: {:?}, Value: {:?}", kv.key, kv.value);
+}
+```
+
+### Prefix Scanning
+
+```rust
+let snapshot = db.snapshot().await?;
+
+let mut iter = snapshot.scan_prefix(b"product:").await?;
+while let Some(kv) = iter.next().await? {
+    println!("Product: {:?}", kv.key);
+}
+```
+
+## Snapshot Isolation
+
+Snapshots provide a consistent view even as the database changes:
+
+```rust
+// Write initial data
+db.put(b"key1", b"original").await?;
+
+// Create snapshot
+let snapshot = db.snapshot().await?;
+
+// Modify database
+db.put(b"key1", b"modified").await?;
+db.put(b"key2", b"new_value").await?;
+
+// Snapshot still sees original state
+assert_eq!(
+    snapshot.get(b"key1").await?,
+    Some(Bytes::from("original"))
+);
+assert_eq!(snapshot.get(b"key2").await?, None);
+
+// Database sees new state
+assert_eq!(
+    db.get(b"key1").await?,
+    Some(Bytes::from("modified"))
+);
+assert_eq!(
+    db.get(b"key2").await?,
+    Some(Bytes::from("new_value"))
+);
+```
+
+## Snapshot Lifetime
+
+Snapshots are automatically cleaned up when dropped:
+
+```rust
+{
+    let snapshot = db.snapshot().await?;
+    // Use snapshot
+    let value = snapshot.get(b"key").await?;
+    // Snapshot is dropped here
+}
+```
+
+<Note>
+  Long-lived snapshots can prevent garbage collection of old data. Drop snapshots when you're done with them.
+</Note>
+
+## Multiple Concurrent Snapshots
+
+Create multiple snapshots at different points in time:
+
+```rust
+// Version 1
+db.put(b"counter", b"1").await?;
+let snapshot1 = db.snapshot().await?;
+
+// Version 2
+db.put(b"counter", b"2").await?;
+let snapshot2 = db.snapshot().await?;
+
+// Version 3
+db.put(b"counter", b"3").await?;
+let snapshot3 = db.snapshot().await?;
+
+// Each snapshot sees its respective version
+assert_eq!(snapshot1.get(b"counter").await?, Some(Bytes::from("1")));
+assert_eq!(snapshot2.get(b"counter").await?, Some(Bytes::from("2")));
+assert_eq!(snapshot3.get(b"counter").await?, Some(Bytes::from("3")));
+```
+
+## Snapshots vs Transactions
+
+| Feature | Snapshots | Transactions |
+|---------|-----------|-------------|
+| Read-only | Yes | No |
+| Can write | No | Yes |
+| Isolation | Snapshot | Snapshot or Serializable |
+| Conflict detection | None | Yes |
+| Overhead | Minimal | Higher |
+
+<Note>
+  Use snapshots for read-only operations and transactions when you need to write.
+</Note>
+
+## Complete Examples
+
+### Example 1: Consistent Backup
+
+```rust
+use slatedb::{Db, Error};
+use bytes::Bytes;
+use std::collections::HashMap;
+
+async fn backup_database(db: &Db) -> Result<HashMap<Bytes, Bytes>, Error> {
+    let snapshot = db.snapshot().await?;
+    let mut backup = HashMap::new();
+    
+    // Scan all data in a consistent state
+    let mut iter = snapshot.scan(..).await?;
+    while let Some(kv) = iter.next().await? {
+        backup.insert(kv.key, kv.value);
+    }
+    
+    Ok(backup)
+}
+
+// Usage
+let backup = backup_database(&db).await?;
+println!("Backed up {} keys", backup.len());
+```
+
+### Example 2: Analytical Query
+
+```rust
+use slatedb::{Db, Error};
+
+async fn compute_statistics(db: &Db, prefix: &[u8]) -> Result<(usize, u64), Error> {
+    let snapshot = db.snapshot().await?;
+    let mut count = 0;
+    let mut total_size = 0u64;
+    
+    let mut iter = snapshot.scan_prefix(prefix).await?;
+    while let Some(kv) = iter.next().await? {
+        count += 1;
+        total_size += kv.value.len() as u64;
+    }
+    
+    Ok((count, total_size))
+}
+
+// Usage
+let (count, size) = compute_statistics(&db, b"user:").await?;
+println!("Users: {}, Total size: {} bytes", count, size);
+```
+
+### Example 3: Point-in-Time Recovery
+
+```rust
+use slatedb::{Db, Error};
+use bytes::Bytes;
+
+struct PointInTimeRecovery {
+    snapshots: Vec<Arc<DbSnapshot>>,
+}
+
+impl PointInTimeRecovery {
+    fn new() -> Self {
+        Self { snapshots: Vec::new() }
+    }
+    
+    async fn create_checkpoint(&mut self, db: &Db) -> Result<(), Error> {
+        let snapshot = db.snapshot().await?;
+        self.snapshots.push(snapshot);
+        println!("Created checkpoint {}", self.snapshots.len());
+        Ok(())
+    }
+    
+    async fn get_at_checkpoint(
+        &self,
+        checkpoint: usize,
+        key: &[u8],
+    ) -> Result<Option<Bytes>, Error> {
+        if checkpoint >= self.snapshots.len() {
+            return Err(Error::from("Invalid checkpoint"));
+        }
+        self.snapshots[checkpoint].get(key).await
+    }
+}
+
+// Usage
+let mut pitr = PointInTimeRecovery::new();
+
+db.put(b"key", b"v1").await?;
+pitr.create_checkpoint(&db).await?;
+
+db.put(b"key", b"v2").await?;
+pitr.create_checkpoint(&db).await?;
+
+db.put(b"key", b"v3").await?;
+pitr.create_checkpoint(&db).await?;
+
+// Recover from checkpoint 0
+let value = pitr.get_at_checkpoint(0, b"key").await?;
+assert_eq!(value, Some(Bytes::from("v1")));
+```
+
+### Example 4: Consistent Read Across Flushes
+
+```rust
+use slatedb::{Db, Error};
+
+async fn long_running_scan(db: &Db) -> Result<(), Error> {
+    // Create snapshot before data is flushed
+    db.put(b"key1", b"value1").await?;
+    db.put(b"key2", b"value2").await?;
+    
+    let snapshot = db.snapshot().await?;
+    
+    // Database gets modified and flushed
+    db.put(b"key3", b"value3").await?;
+    db.flush().await?;
+    db.put(b"key1", b"modified").await?;
+    
+    // Snapshot still sees original state
+    let mut iter = snapshot.scan(..).await?;
+    let mut keys = Vec::new();
+    while let Some(kv) = iter.next().await? {
+        keys.push(kv.key.to_vec());
+    }
+    
+    // Should only see key1 and key2 with original values
+    assert_eq!(keys.len(), 2);
+    
+    Ok(())
+}
+```
+
+## Snapshots with Flush Operations
+
+Snapshots remain consistent even when data is flushed to storage:
+
+```rust
+// Create snapshot
+db.put(b"key1", b"value1").await?;
+let snapshot = db.snapshot().await?;
+
+// Write and flush new data
+db.put(b"key2", b"value2").await?;
+db.flush().await?;
+
+// Snapshot doesn't see flushed data
+assert_eq!(snapshot.get(b"key1").await?, Some(Bytes::from("value1")));
+assert_eq!(snapshot.get(b"key2").await?, None);
+```
+
+## DbRead Trait
+
+Snapshots implement the `DbRead` trait, making them compatible with generic read operations:
+
+```rust
+use slatedb::DbRead;
+
+async fn count_keys<R: DbRead>(reader: &R, prefix: &[u8]) -> Result<usize, Error> {
+    let mut count = 0;
+    let mut iter = reader.scan_prefix(prefix).await?;
+    while let Some(_) = iter.next().await? {
+        count += 1;
+    }
+    Ok(count)
+}
+
+// Works with both Db and DbSnapshot
+let count1 = count_keys(&db, b"user:").await?;
+let snapshot = db.snapshot().await?;
+let count2 = count_keys(&snapshot, b"user:").await?;
+```
+
+## Performance Considerations
+
+<Steps>
+  <Step title="Create Snapshots Sparingly">
+    Each snapshot adds a small overhead. Don't create unnecessary snapshots.
+  </Step>
+  
+  <Step title="Drop Snapshots Promptly">
+    Long-lived snapshots prevent cleanup of old data. Drop them when done.
+  </Step>
+  
+  <Step title="Avoid Too Many Concurrent Snapshots">
+    Hundreds of concurrent snapshots can impact performance. Keep it reasonable.
+  </Step>
+  
+  <Step title="Use Snapshots for Long Reads">
+    Snapshots are perfect for analytical queries or backups that take time.
+  </Step>
+</Steps>
+
+## Snapshot Metadata
+
+Snapshots track the sequence number at creation time:
+
+```rust
+let snapshot = db.snapshot().await?;
+let seq = snapshot.seqnum();  // Get snapshot sequence number
+```
+
+<Note>
+  The sequence number represents the logical timestamp of the snapshot.
+</Note>
+
+## Error Handling
+
+Handle snapshot operations errors:
+
+```rust
+let snapshot = db.snapshot().await?;
+
+match snapshot.get(b"key").await {
+    Ok(Some(value)) => println!("Found: {:?}", value),
+    Ok(None) => println!("Key not found in snapshot"),
+    Err(e) => eprintln!("Error reading snapshot: {}", e),
+}
+```
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Transactions" icon="arrows-rotate" href="/operations/transactions">
+    Learn about read-write transactions
+  </Card>
+  <Card title="Checkpoints" icon="bookmark" href="/operations/checkpoints">
+    Create durable point-in-time checkpoints
+  </Card>
+</CardGroup>

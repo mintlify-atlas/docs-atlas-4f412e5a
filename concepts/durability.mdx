@@ -1,0 +1,595 @@
+---
+title: Durability
+description: Understand SlateDB's durability guarantees and how to configure them for your needs
+---
+
+SlateDB provides configurable durability guarantees through its Write-Ahead Log (WAL) and flexible commit semantics. Understanding these guarantees is crucial for balancing performance with data safety in your application.
+
+## Durability Guarantees Overview
+
+SlateDB offers three levels of durability for writes:
+
+1. **Memory**: Write acknowledged when in MemTable (not durable)
+2. **Local**: Write acknowledged when in local WAL buffer (planned)
+3. **Remote**: Write acknowledged when in object storage (fully durable)
+
+```rust
+pub enum DurabilityLevel {
+    Memory,  // Fast, not durable
+    Local,   // Planned: medium speed, durable to local disk
+    Remote,  // Slow, fully durable to object storage
+}
+```
+
+See: `slatedb/src/config.rs`
+
+## Write Path and Durability
+
+Understanding the write path helps clarify when data becomes durable:
+
+```
+┌─────────────────────────────────────────────────────┐
+│                  Write Path                          │
+└─────────────────────────────────────────────────────┘
+
+1. put(key, value) called
+   ↓
+2. Write to MemTable (in-memory skiplist)
+   ✓ Visible to readers immediately
+   ✗ Lost on crash
+   ↓
+3. Write to WAL Buffer (in-memory)
+   ✓ Batched for efficiency
+   ✗ Lost on crash
+   ↓
+4. WAL Buffer Flush (periodic or on threshold)
+   → Write WAL SST to object storage
+   ✓ Durable
+   ✓ Survives process crash
+   ↓
+5. MemTable Full → Freeze to Immutable
+   ↓
+6. Immutable MemTable → L0 SST
+   → Write L0 SST to object storage
+   → Update manifest (CAS)
+   ✓ Fully durable and compacted
+   ✓ WAL can be garbage collected
+```
+
+See: `slatedb/src/db.rs:275-307`
+
+## Synchronous vs. Asynchronous Commits
+
+### Asynchronous Commit (Default)
+
+Writes return immediately after being written to the MemTable:
+
+```rust
+use slatedb::{Db, config::WriteOptions};
+
+let options = WriteOptions {
+    await_durable: false,  // Default
+};
+
+let handle = db.put_with_options(b"key", b"value", &options).await?;
+// Returns immediately
+```
+
+**Characteristics:**
+- **Latency**: Microseconds (in-memory operation)
+- **Throughput**: Very high
+- **Durability**: None (lost on crash before WAL flush)
+- **Use case**: High-throughput workloads where some data loss is acceptable
+
+See: `slatedb/src/db.rs:1128-1137`
+
+### Synchronous Commit
+
+Writes return only after data is persisted to object storage:
+
+```rust
+use slatedb::{Db, config::WriteOptions};
+
+let options = WriteOptions {
+    await_durable: true,  // Wait for durability
+};
+
+let handle = db.put_with_options(b"key", b"value", &options).await?;
+// Returns after WAL flushed to object storage
+```
+
+**Characteristics:**
+- **Latency**: Milliseconds (object storage PUT)
+- **Throughput**: Limited by WAL flush rate
+- **Durability**: Full (survives any crash)
+- **Use case**: Critical data that cannot be lost
+
+See: `slatedb/src/db.rs:1128-1137`
+
+## Write-Ahead Log (WAL)
+
+The WAL provides durability by persisting writes before they're compacted to L0:
+
+### WAL Architecture
+
+```
+┌────────────────────────────────────────────────┐
+│             WAL Buffer Manager                 │
+├────────────────────────────────────────────────┤
+│  In-memory buffer:                             │
+│  • Accumulates writes                          │
+│  • Tracks sequence numbers                     │
+│  • Monitors buffer size                        │
+│                                                 │
+│  Flush triggers:                               │
+│  • Timer: flush_interval elapsed              │
+│  • Size: buffer exceeds threshold              │
+│  • Explicit: db.flush() called                │
+└────────────────────────────────────────────────┘
+                     │
+                     ▼ (Flush)
+┌────────────────────────────────────────────────┐
+│        Object Storage: /wal/{id}.sst           │
+│  • Immutable once written                      │
+│  • Contains batch of writes                    │
+│  • Indexed by sequence numbers                 │
+│  • Used for crash recovery                     │
+└────────────────────────────────────────────────┘
+```
+
+See: `slatedb/src/wal_buffer.rs`
+
+### WAL Configuration
+
+```rust
+use slatedb::config::Settings;
+use std::time::Duration;
+
+let settings = Settings {
+    flush_interval: Duration::from_millis(100),  // WAL flush interval
+    l0_sst_size_bytes: 4 * 1024 * 1024,         // 4MB L0 SSTs
+    max_unflushed_bytes: 64 * 1024 * 1024,      // 64MB max buffered
+    wal_enabled: true,                           // Enable WAL
+    ..Default::default()
+};
+
+let db = Db::builder(path, object_store)
+    .with_settings(settings)
+    .build()
+    .await?;
+```
+
+Key settings:
+
+- **`flush_interval`**: How often to flush WAL buffer (default: 1s)
+  - Lower = better durability, higher API costs
+  - Higher = better throughput, worse durability
+
+- **`l0_sst_size_bytes`**: Size threshold for L0 flush (default: configurable)
+  - Larger = fewer L0 SSTs, but slower recovery
+  - Smaller = more L0 SSTs, but faster recovery
+
+- **`max_unflushed_bytes`**: Backpressure threshold (default: 64MB)
+  - When exceeded, writes block until flush completes
+  - Prevents unbounded memory growth
+
+See: `slatedb/src/config.rs`
+
+### WAL Disabling (Advanced)
+
+For testing or specific use cases, WAL can be disabled:
+
+```rust
+#[cfg(feature = "wal_disable")]
+let settings = Settings {
+    wal_enabled: false,  // No durability!
+    ..Default::default()
+};
+```
+
+**⚠️ WARNING**: Disabling WAL means:
+- No crash recovery
+- All data in MemTable lost on crash
+- Only use for ephemeral/testing scenarios
+
+See: `slatedb/src/db.rs:268-273`
+
+## Crash Recovery
+
+SlateDB recovers from crashes by replaying the WAL:
+
+### Recovery Protocol
+
+```
+┌─────────────────────────────────────────────────┐
+│           Database Startup/Recovery             │
+└─────────────────────────────────────────────────┘
+
+1. Load latest manifest from object storage
+   • Determine last compacted WAL ID
+   • Load L0 SSTs and sorted runs
+   • Get last sequence number
+   ↓
+2. Fence old writers (increment epoch)
+   • Prevents zombie processes from corrupting state
+   • Uses CAS on manifest
+   ↓
+3. List WAL SSTs after last compacted
+   • Find all /wal/{id}.sst where id > last_compacted
+   • Sort by ID
+   ↓
+4. Replay WAL SSTs into MemTable
+   • Read each WAL SST in order
+   • Insert entries into new MemTable
+   • Skip entries with seq <= last_l0_seq
+   ↓
+5. Resume normal operation
+   • New writes continue from last seq + 1
+   • Background flusher starts
+```
+
+See: `slatedb/src/db.rs:505-542`
+See RFC: `rfcs/0009-separate-wal.md`
+
+### Recovery Performance
+
+Recovery time depends on:
+
+- **Amount of unflushed data**: More WAL SSTs = longer recovery
+- **WAL SST size**: Smaller SSTs = faster streaming reads
+- **Object storage latency**: S3 GET latency affects replay speed
+
+**Typical recovery times:**
+
+| Unflushed Data | Recovery Time |
+|----------------|---------------|
+| 10 MB | Less than 1 second |
+| 100 MB | 1-5 seconds |
+| 1 GB | 10-30 seconds |
+| 10 GB | 1-3 minutes |
+
+## Group Commit
+
+SlateDB implements **group commit** to batch multiple synchronous writes:
+
+```
+┌────────────────────────────────────────────────┐
+│              Group Commit Pipeline             │
+└────────────────────────────────────────────────┘
+
+Thread 1: put("a", "1", await_durable=true)
+Thread 2: put("b", "2", await_durable=true)
+Thread 3: put("c", "3", await_durable=true)
+          ↓
+       [Wait for flush_interval]
+          ↓
+Batch all 3 writes into single WAL SST
+          ↓
+     Write WAL SST once
+          ↓
+Notify all 3 threads: writes durable
+```
+
+See: `slatedb/src/wal_buffer.rs`
+
+**Benefits:**
+- Amortize object storage PUT cost across multiple writes
+- Higher throughput for synchronous commits
+- Lower per-write latency (shared flush)
+
+**Configuration:**
+
+```rust
+let settings = Settings {
+    flush_interval: Duration::from_millis(10),  // Smaller = lower latency
+    l0_sst_size_bytes: 4 * 1024 * 1024,        // Larger = more batching
+    ..Default::default()
+};
+```
+
+## Durability Levels in Detail
+
+### Memory Durability
+
+```rust
+pub async fn put(&self, key: &[u8], value: &[u8]) -> Result<WriteHandle> {
+    // Default: await_durable=false
+    let mut batch = WriteBatch::new();
+    batch.put(key, value);
+    self.write(batch).await
+}
+```
+
+**What happens:**
+1. Write to MemTable (skiplist)
+2. Write to WAL buffer (memory)
+3. Return immediately
+
+**Guarantees:**
+- ✅ Immediately visible to readers
+- ✅ ACID within a transaction
+- ❌ Lost if process crashes before flush
+
+**When to use:**
+- High-throughput logging
+- Transient caches
+- Stream processing state
+- Workloads with external durability (e.g., Kafka)
+
+### Remote Durability
+
+```rust
+let options = WriteOptions {
+    await_durable: true,
+};
+
+let handle = db.put_with_options(b"key", b"value", &options).await?;
+// Blocks until WAL flushed to object storage
+```
+
+**What happens:**
+1. Write to MemTable
+2. Write to WAL buffer
+3. Trigger flush if needed
+4. **Wait for WAL SST write to object storage**
+5. Return with durability confirmed
+
+**Guarantees:**
+- ✅ Survives process crash
+- ✅ Survives machine crash
+- ✅ Object storage replication (11 nines)
+
+**When to use:**
+- Financial transactions
+- User data that cannot be lost
+- Critical configuration
+- Exactly-once processing
+
+### Local Durability (Planned)
+
+Planned feature for local disk-based WAL:
+
+```rust
+// Future API
+let options = WriteOptions {
+    durability_level: DurabilityLevel::Local,
+};
+
+let handle = db.put_with_options(b"key", b"value", &options).await?;
+// Would block until fsync() to local disk
+```
+
+**Target characteristics:**
+- Latency: 1-10ms (local disk)
+- Survives: Process crash
+- Does NOT survive: Machine crash
+
+See RFC: `rfcs/0008-synchronous-commit.md`
+
+## Flush Strategies
+
+You can explicitly control flush behavior:
+
+### Flush WAL Only
+
+```rust
+use slatedb::config::{FlushOptions, FlushType};
+
+let options = FlushOptions {
+    flush_type: FlushType::Wal,
+};
+
+db.flush_with_options(options).await?;
+// Forces WAL to object storage
+```
+
+### Flush MemTable to L0
+
+```rust
+let options = FlushOptions {
+    flush_type: FlushType::MemTable,
+};
+
+db.flush_with_options(options).await?;
+// Forces L0 SST creation and manifest update
+```
+
+### Default Flush
+
+```rust
+db.flush().await?;
+// If WAL enabled: flushes WAL
+// If WAL disabled: flushes MemTable
+```
+
+See: `slatedb/src/db.rs:449-467`
+
+## Backpressure
+
+SlateDB applies **backpressure** when too much unflushed data accumulates:
+
+```rust
+pub struct Settings {
+    pub max_unflushed_bytes: usize,  // Default: 64MB
+}
+```
+
+When `(WAL buffer + immutable MemTables) > max_unflushed_bytes`:
+
+1. **Block new writes**: `put()` calls wait
+2. **Wait for flush**: Monitor oldest unflushed data
+3. **Resume writes**: Once below threshold
+
+See: `slatedb/src/db.rs:309-405`
+
+**Why backpressure?**
+- Prevent unbounded memory growth
+- Ensure bounded recovery time
+- Maintain durability guarantees
+
+**Configuration:**
+
+```rust
+let settings = Settings {
+    max_unflushed_bytes: 128 * 1024 * 1024,  // 128MB
+    flush_interval: Duration::from_millis(100),
+    ..Default::default()
+};
+```
+
+Adjust based on:
+- Available memory
+- Write rate
+- Acceptable recovery time
+
+## Error Handling
+
+### WAL Write Failures
+
+If a WAL flush fails:
+
+```rust
+match db.put(b"key", b"value").await {
+    Ok(handle) => { /* Write succeeded */ },
+    Err(SlateDBError::Fenced) => {
+        // Another writer took over
+        // This writer is now fenced
+        // Database enters read-only mode
+    },
+    Err(SlateDBError::ObjectStore(err)) => {
+        // Object storage failure
+        // Write may be retried
+    },
+    Err(err) => { /* Other error */ },
+}
+```
+
+See: `slatedb/src/error.rs`
+
+**Permanent failures** (disk full, corrupted storage):
+- Database marks itself as fenced
+- Switches to read-only mode
+- No new writes accepted
+- Operators must intervene
+
+See RFC: `rfcs/0008-synchronous-commit.md:118-124`
+
+## Best Practices
+
+### 1. Choose Appropriate Durability
+
+```rust
+// Critical data: use synchronous
+let handle = db.put_with_options(
+    b"user_purchase",
+    b"data",
+    &WriteOptions { await_durable: true },
+).await?;
+
+// Metrics: use asynchronous
+let handle = db.put_with_options(
+    b"metric_count",
+    b"42",
+    &WriteOptions { await_durable: false },
+).await?;
+```
+
+### 2. Batch Related Writes
+
+```rust
+use slatedb::WriteBatch;
+
+let mut batch = WriteBatch::new();
+batch.put(b"key1", b"value1");
+batch.put(b"key2", b"value2");
+batch.put(b"key3", b"value3");
+
+// Single atomic batch with durability
+db.write_with_options(
+    batch,
+    &WriteOptions { await_durable: true }
+).await?;
+```
+
+### 3. Tune Flush Interval
+
+Balance latency vs. API costs:
+
+```rust
+// Low latency (expensive)
+let settings = Settings {
+    flush_interval: Duration::from_millis(10),
+    ..Default::default()
+};
+
+// High throughput (cheaper)
+let settings = Settings {
+    flush_interval: Duration::from_secs(1),
+    ..Default::default()
+};
+```
+
+### 4. Monitor Unflushed Data
+
+```rust
+use slatedb::stats;
+
+// Check unflushed size
+let unflushed = db.stats().total_mem_size_bytes;
+if unflushed > threshold {
+    // Explicitly flush
+    db.flush().await?;
+}
+```
+
+### 5. Handle Fencing Gracefully
+
+```rust
+loop {
+    match db.put(b"key", b"value").await {
+        Ok(handle) => break,
+        Err(SlateDBError::Fenced) => {
+            // Another writer won, gracefully shutdown
+            log::warn!("Writer fenced, shutting down");
+            return Err(SlateDBError::Fenced);
+        },
+        Err(err) => {
+            // Retry transient errors
+            log::warn!("Write failed: {}, retrying", err);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+}
+```
+
+## Comparison with Other Systems
+
+| System | Durability Model | Default |
+|--------|-----------------|----------|
+| PostgreSQL | `fsync()` to local disk | Synchronous |
+| RocksDB | `fsync()` to local disk | Asynchronous |
+| SlateDB | Object storage replication | Asynchronous |
+| Redis | AOF or RDB snapshots | Asynchronous |
+| Cassandra | Commit log + memtable | Eventually durable |
+
+SlateDB's durability is **unique**:
+- No local disk required
+- Higher latency than local disk (10-100ms vs 1-10ms)
+- But **much higher durability** (11 nines vs 3-4 nines)
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Architecture" icon="sitemap" href="/concepts/architecture">
+    Understand the overall system architecture
+  </Card>
+  <Card title="Configuration" icon="sliders" href="/configuration/settings">
+    Learn how to configure SlateDB settings
+  </Card>
+  <Card title="Error Handling" icon="triangle-exclamation" href="/api/error-handling">
+    Handle errors and failures gracefully
+  </Card>
+  <Card title="Performance Tuning" icon="gauge-high" href="/configuration/settings">
+    Optimize for your workload
+  </Card>
+</CardGroup>

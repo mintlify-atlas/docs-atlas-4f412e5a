@@ -1,0 +1,116 @@
+---
+title: Introduction
+description: Learn about SlateDB, a cloud native embedded storage engine built as an LSM-tree on object storage
+---
+
+SlateDB is an embedded storage engine built as a [log-structured merge-tree](https://en.wikipedia.org/wiki/Log-structured_merge-tree) (LSM-tree). Unlike traditional LSM-tree storage engines, SlateDB writes data to object storage (S3, GCS, ABS, MinIO, Tigris, and more).
+
+## Why SlateDB?
+
+Leveraging object storage allows SlateDB to provide:
+
+- **Bottomless storage capacity** - No need to manage disk space or provision storage
+- **High durability** - Built-in replication and redundancy from object storage
+- **Easy replication** - Data naturally available across regions
+- **Cost efficiency** - Pay only for what you store
+
+The trade-off is that object storage has higher latency and higher API costs than local disk. SlateDB mitigates these challenges through intelligent batching and caching.
+
+## How It Works
+
+### Write Optimization
+
+To mitigate high write API costs (PUTs), SlateDB batches writes. Rather than writing every `put()` call to object storage, MemTables are flushed periodically to object storage as string-sorted tables (SSTs). The flush interval is configurable.
+
+`put()` returns a `Future` that resolves when the data is durably persisted. Clients that prefer lower latency at the cost of durability can use `put_with_options` with `await_durable` set to `false`.
+
+### Read Optimization
+
+To mitigate read latency and read API costs (GETs), SlateDB uses standard LSM-tree caching techniques:
+
+- **In-memory block caches** - Keep frequently accessed data in memory
+- **Compression** - Reduce storage and transfer costs
+- **Bloom filters** - Skip unnecessary reads
+- **Local SST disk caches** - Cache full SSTs locally for faster access
+
+## Key Features
+
+<CardGroup cols={2}>
+  <Card title="Basic API" icon="code">
+    Get, put, delete operations with async support
+  </Card>
+  <Card title="Range Queries" icon="arrows-left-right">
+    Efficient scanning over key ranges with seek support
+  </Card>
+  <Card title="Transactions" icon="lock">
+    ACID transactions with snapshot isolation (SI) and serializable snapshot isolation (SSI)
+  </Card>
+  <Card title="Atomic Batches" icon="layer-group">
+    Write multiple operations atomically
+  </Card>
+  <Card title="Merge Operator" icon="code-merge">
+    User-defined merge functions for conflict resolution
+  </Card>
+  <Card title="Checkpoints" icon="bookmark">
+    Create durable, point-in-time snapshots
+  </Card>
+  <Card title="Compaction" icon="compress">
+    Automatic background compaction to optimize storage
+  </Card>
+  <Card title="Change Data Capture" icon="stream">
+    Track and stream database changes
+  </Card>
+</CardGroup>
+
+## Object Store Support
+
+SlateDB uses the [`object_store`](https://docs.rs/object_store/latest/object_store/) crate to interact with object storage, supporting any object storage that implements the `ObjectStore` trait:
+
+- Amazon S3 and S3-compatible stores (MinIO, LocalStack, etc.)
+- Google Cloud Storage (GCS)
+- Azure Blob Storage (ABS)
+- Tigris
+- Local filesystem (for development)
+- In-memory (for testing)
+
+## Language Support
+
+SlateDB provides official bindings for multiple languages:
+
+- **Rust** - Native implementation with full feature support
+- **Go** - Official bindings via FFI
+- **Java** - Official bindings using Java 24 FFM API
+- **Python** - Official bindings with sync and async APIs
+
+Community-maintained bindings are also available for .NET, Ruby, and TypeScript.
+
+## Production Ready
+
+SlateDB is used in production by companies including:
+
+- [Embucket](https://www.embucket.com)
+- [Gadget](https://gadget.dev)
+- [Massive](https://massive.com)
+- [Responsive](https://responsive.dev)
+- [Tensorlake](https://www.tensorlake.ai)
+
+And many more. See the [full list of adopters](https://github.com/slatedb/slatedb#adopters).
+
+## Release Schedule
+
+SlateDB follows Semantic Versioning. New versions are released approximately every 2 months at the end of each even month (February, April, June, etc.). We guarantee forward/backward compatibility for storage formats between adjacent versions.
+
+<Note>
+While storage format compatibility is guaranteed, API compatibility may change between versions as the project continues to evolve.
+</Note>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="bolt" href="/quickstart">
+    Get started with SlateDB in 5 minutes
+  </Card>
+  <Card title="Installation" icon="download" href="/installation">
+    Install SlateDB for your language
+  </Card>
+</CardGroup>

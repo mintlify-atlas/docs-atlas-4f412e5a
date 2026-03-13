@@ -1,0 +1,406 @@
+---
+title: Checkpoints
+description: Create durable, named recovery points in SlateDB
+---
+
+Checkpoints provide durable, named recovery points that persist in object storage. Unlike snapshots (which are in-memory), checkpoints can be used to restore your database to a specific point in time, even after restart.
+
+## Creating Checkpoints
+
+### Basic Checkpoint Creation
+
+Create a checkpoint from an open database:
+
+```rust
+use slatedb::config::{CheckpointScope, CheckpointOptions};
+
+let result = db.create_checkpoint(
+    CheckpointScope::All,
+    &CheckpointOptions::default(),
+).await?;
+
+println!("Checkpoint ID: {}", result.id);
+println!("Manifest ID: {}", result.manifest_id);
+```
+
+<Note>
+  `CheckpointScope::All` flushes all in-memory data (WAL and memtables) before creating the checkpoint, ensuring a complete point-in-time snapshot.
+</Note>
+
+### Using Admin API
+
+Create checkpoints without opening the database:
+
+```rust
+use slatedb::admin::AdminBuilder;
+use slatedb::config::CheckpointOptions;
+
+let admin = AdminBuilder::new("/path/to/db", object_store).build();
+
+let result = admin
+    .create_detached_checkpoint(&CheckpointOptions::default())
+    .await?;
+
+println!("Created checkpoint: {}", result.id);
+```
+
+## Checkpoint Options
+
+### Named Checkpoints
+
+Assign names to checkpoints for easy identification:
+
+```rust
+use slatedb::config::CheckpointOptions;
+
+let result = db.create_checkpoint(
+    CheckpointScope::All,
+    &CheckpointOptions {
+        name: Some("before_migration".to_string()),
+        ..CheckpointOptions::default()
+    },
+).await?;
+```
+
+<Note>
+  Named checkpoints make it easier to identify specific recovery points. Names don't have to be unique.
+</Note>
+
+### Checkpoint Expiration
+
+Set automatic expiration for temporary checkpoints:
+
+```rust
+use std::time::Duration;
+use slatedb::config::CheckpointOptions;
+
+let result = db.create_checkpoint(
+    CheckpointScope::All,
+    &CheckpointOptions {
+        lifetime: Some(Duration::from_secs(3600)),  // 1 hour
+        ..CheckpointOptions::default()
+    },
+).await?;
+```
+
+<Warning>
+  Expired checkpoints are subject to garbage collection. Don't rely on expired checkpoints for recovery.
+</Warning>
+
+### Creating from Existing Checkpoints
+
+Create a new checkpoint from an existing one:
+
+```rust
+use uuid::Uuid;
+use slatedb::config::CheckpointOptions;
+
+let source_checkpoint_id = Uuid::parse_str("...").unwrap();
+
+let result = admin.create_detached_checkpoint(
+    &CheckpointOptions {
+        source: Some(source_checkpoint_id),
+        name: Some("derived_checkpoint".to_string()),
+        ..CheckpointOptions::default()
+    },
+).await?;
+```
+
+## Managing Checkpoints
+
+### Listing Checkpoints
+
+List all checkpoints:
+
+```rust
+let checkpoints = admin.list_checkpoints(None).await?;
+
+for cp in checkpoints {
+    println!("ID: {}", cp.id);
+    println!("Name: {:?}", cp.name);
+    println!("Created: {}", cp.create_time);
+    println!("Expires: {:?}", cp.expire_time);
+}
+```
+
+Filter by name:
+
+```rust
+let checkpoints = admin
+    .list_checkpoints(Some("production_backup"))
+    .await?;
+```
+
+### Refreshing Checkpoint Expiration
+
+Extend the lifetime of an expiring checkpoint:
+
+```rust
+use std::time::Duration;
+
+admin.refresh_checkpoint(
+    checkpoint_id,
+    Some(Duration::from_secs(86400)),  // Extend by 24 hours
+).await?;
+```
+
+### Deleting Checkpoints
+
+Manually delete a checkpoint:
+
+```rust
+admin.delete_checkpoint(checkpoint_id).await?;
+```
+
+<Note>
+  Deleting a checkpoint removes it from the manifest but doesn't immediately delete the underlying SST files. They're cleaned up during garbage collection.
+</Note>
+
+## Checkpoint Scope
+
+### CheckpointScope::All
+
+Flushes everything before creating the checkpoint:
+
+```rust
+// Flushes WAL and memtables
+let result = db.create_checkpoint(
+    CheckpointScope::All,
+    &CheckpointOptions::default(),
+).await?;
+```
+
+Use this when you need a complete, durable checkpoint that includes all recent writes.
+
+## Checkpoint Structure
+
+Checkpoints contain:
+
+```rust
+pub struct Checkpoint {
+    pub id: Uuid,                      // Unique checkpoint identifier
+    pub manifest_id: u64,              // Manifest version at checkpoint time
+    pub expire_time: Option<DateTime<Utc>>,  // When it expires (if set)
+    pub create_time: DateTime<Utc>,    // When it was created
+    pub name: Option<String>,          // Optional name
+}
+```
+
+## Complete Examples
+
+### Example 1: Daily Backup with Rotation
+
+```rust
+use slatedb::{Db, Error};
+use slatedb::admin::AdminBuilder;
+use slatedb::config::CheckpointOptions;
+use std::time::Duration;
+use chrono::Utc;
+
+async fn create_daily_backup(db: &Db, admin: &Admin) -> Result<(), Error> {
+    let date = Utc::now().format("%Y-%m-%d").to_string();
+    
+    // Create checkpoint with 7-day retention
+    let result = db.create_checkpoint(
+        CheckpointScope::All,
+        &CheckpointOptions {
+            name: Some(format!("daily_backup_{}", date)),
+            lifetime: Some(Duration::from_secs(7 * 86400)),
+            ..CheckpointOptions::default()
+        },
+    ).await?;
+    
+    println!("Created daily backup: {}", result.id);
+    Ok(())
+}
+```
+
+### Example 2: Pre-Migration Checkpoint
+
+```rust
+use slatedb::{Db, Error};
+use slatedb::config::{CheckpointScope, CheckpointOptions};
+
+async fn migration_with_checkpoint(
+    db: &Db,
+) -> Result<(), Error> {
+    // Create safety checkpoint before migration
+    let checkpoint = db.create_checkpoint(
+        CheckpointScope::All,
+        &CheckpointOptions {
+            name: Some("pre_schema_migration_v2".to_string()),
+            lifetime: Some(Duration::from_secs(30 * 86400)),  // Keep for 30 days
+            ..CheckpointOptions::default()
+        },
+    ).await?;
+    
+    println!("Safety checkpoint: {}", checkpoint.id);
+    
+    // Run migration
+    run_migration(db).await?;
+    
+    println!("Migration complete. Checkpoint available for rollback.");
+    Ok(())
+}
+
+async fn run_migration(db: &Db) -> Result<(), Error> {
+    // Your migration logic
+    Ok(())
+}
+```
+
+### Example 3: Testing with Checkpoints
+
+```rust
+use slatedb::{Db, Error};
+use slatedb::admin::AdminBuilder;
+use slatedb::config::CheckpointOptions;
+
+async fn test_with_checkpoint_cleanup(
+    db: &Db,
+    admin: &Admin,
+) -> Result<(), Error> {
+    // Create checkpoint before test
+    let checkpoint = db.create_checkpoint(
+        CheckpointScope::All,
+        &CheckpointOptions {
+            name: Some("test_checkpoint".to_string()),
+            ..CheckpointOptions::default()
+        },
+    ).await?;
+    
+    // Run tests that modify data
+    run_tests(db).await?;
+    
+    // Clean up test checkpoint
+    admin.delete_checkpoint(checkpoint.id).await?;
+    
+    Ok(())
+}
+
+async fn run_tests(db: &Db) -> Result<(), Error> {
+    // Your test logic
+    Ok(())
+}
+```
+
+### Example 4: Checkpoint Chain
+
+```rust
+use slatedb::admin::AdminBuilder;
+use slatedb::config::CheckpointOptions;
+use uuid::Uuid;
+
+async fn create_checkpoint_chain(
+    admin: &Admin,
+    base_checkpoint: Uuid,
+    stages: Vec<&str>,
+) -> Result<Vec<Uuid>, Error> {
+    let mut checkpoint_ids = vec![base_checkpoint];
+    let mut current_checkpoint = base_checkpoint;
+    
+    for stage in stages {
+        let result = admin.create_detached_checkpoint(
+            &CheckpointOptions {
+                source: Some(current_checkpoint),
+                name: Some(stage.to_string()),
+                ..CheckpointOptions::default()
+            },
+        ).await?;
+        
+        println!("Created checkpoint for stage: {}", stage);
+        checkpoint_ids.push(result.id);
+        current_checkpoint = result.id;
+    }
+    
+    Ok(checkpoint_ids)
+}
+
+// Usage
+let stages = vec!["stage1", "stage2", "stage3"];
+let chain = create_checkpoint_chain(&admin, base_id, stages).await?;
+```
+
+## Restoring from Checkpoints
+
+To restore from a checkpoint, open the database at the checkpoint's manifest version:
+
+```rust
+use slatedb::admin::AdminBuilder;
+
+// List checkpoints to find the one you want
+let checkpoints = admin.list_checkpoints(Some("before_migration")).await?;
+let checkpoint = checkpoints.first().unwrap();
+
+println!("Restoring from checkpoint: {}", checkpoint.id);
+println!("Manifest ID: {}", checkpoint.manifest_id);
+
+// The restore process involves opening the database at the checkpoint's manifest
+// This is typically done through administrative tools or database initialization
+```
+
+<Note>
+  The exact restoration process depends on your deployment setup. Checkpoints provide the manifest ID needed for recovery.
+</Note>
+
+## Checkpoint vs Snapshot
+
+| Feature | Checkpoints | Snapshots |
+|---------|-------------|----------|
+| Persistence | Durable (in manifest) | In-memory only |
+| Survives restart | Yes | No |
+| Named | Yes | No |
+| Expiration | Configurable | Lifetime-based |
+| Use case | Recovery points | Read consistency |
+| Overhead | Higher (requires flush) | Minimal |
+
+## Best Practices
+
+<Steps>
+  <Step title="Name Your Checkpoints">
+    Always provide meaningful names to identify recovery points easily.
+  </Step>
+  
+  <Step title="Set Appropriate Lifetimes">
+    Use expiration times to prevent checkpoint accumulation and control storage costs.
+  </Step>
+  
+  <Step title="Flush Before Critical Operations">
+    Create checkpoints before schema changes, major updates, or risky operations.
+  </Step>
+  
+  <Step title="Document Checkpoint Purpose">
+    Keep track of why each checkpoint was created and when it can be safely deleted.
+  </Step>
+  
+  <Step title="Monitor Checkpoint Count">
+    Too many checkpoints can complicate management. Regularly clean up old ones.
+  </Step>
+</Steps>
+
+## Error Handling
+
+```rust
+use slatedb::Error;
+
+match db.create_checkpoint(CheckpointScope::All, &CheckpointOptions::default()).await {
+    Ok(result) => {
+        println!("Checkpoint created: {}", result.id);
+    }
+    Err(e) => {
+        eprintln!("Failed to create checkpoint: {}", e);
+        // Handle error (e.g., database closed, I/O error)
+    }
+}
+```
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Snapshots" icon="camera" href="/operations/snapshots">
+    Learn about in-memory snapshots
+  </Card>
+  <Card title="Configuration" icon="gear" href="/configuration">
+    Configure checkpoint and compaction settings
+  </Card>
+</CardGroup>

@@ -1,0 +1,547 @@
+---
+title: 'DbTransaction'
+description: 'Transaction interface for atomic read-write operations'
+---
+
+The `DbTransaction` struct provides atomic read-write operations with configurable isolation levels.
+
+## Creating a Transaction
+
+```rust
+use slatedb::{Db, IsolationLevel};
+
+let txn = db.begin(IsolationLevel::Snapshot).await?;
+```
+
+## Read Operations
+
+### get
+
+```rust
+pub async fn get<K: AsRef<[u8]> + Send>(&self, key: K) -> Result<Option<Bytes>, Error>
+```
+
+Get a value from the transaction with default read options.
+
+<ParamField path="key" type="K: AsRef<[u8]> + Send" required>
+  The key to retrieve
+</ParamField>
+
+<ResponseField name="Result" type="Result<Option<Bytes>, Error>">
+  Returns `Some(Bytes)` if the key exists, `None` otherwise
+</ResponseField>
+
+```rust
+let txn = db.begin(IsolationLevel::Snapshot).await?;
+let value = txn.get(b"key").await?;
+```
+
+<Info>
+In SSI mode, this operation tracks the read for conflict detection.
+</Info>
+
+### get_with_options
+
+```rust
+pub async fn get_with_options<K: AsRef<[u8]> + Send>(
+    &self,
+    key: K,
+    options: &ReadOptions,
+) -> Result<Option<Bytes>, Error>
+```
+
+Get a value with custom read options.
+
+<ParamField path="key" type="K: AsRef<[u8]> + Send" required>
+  The key to retrieve
+</ParamField>
+
+<ParamField path="options" type="&ReadOptions" required>
+  Read options to customize the operation
+</ParamField>
+
+<ResponseField name="Result" type="Result<Option<Bytes>, Error>">
+  Returns the value if found
+</ResponseField>
+
+### get_key_value
+
+```rust
+pub async fn get_key_value<K: AsRef<[u8]> + Send>(
+    &self,
+    key: K,
+) -> Result<Option<KeyValue>, Error>
+```
+
+Get a key-value pair with metadata.
+
+<ParamField path="key" type="K: AsRef<[u8]> + Send" required>
+  The key to look up
+</ParamField>
+
+<ResponseField name="Result" type="Result<Option<KeyValue>, Error>">
+  Returns `Some(KeyValue)` with key, value, and metadata
+</ResponseField>
+
+### get_key_value_with_options
+
+```rust
+pub async fn get_key_value_with_options<K: AsRef<[u8]> + Send>(
+    &self,
+    key: K,
+    options: &ReadOptions,
+) -> Result<Option<KeyValue>, Error>
+```
+
+Get a key-value pair with custom read options.
+
+<ParamField path="key" type="K: AsRef<[u8]> + Send" required>
+  The key to look up
+</ParamField>
+
+<ParamField path="options" type="&ReadOptions" required>
+  Read options to use
+</ParamField>
+
+<ResponseField name="Result" type="Result<Option<KeyValue>, Error>">
+  Returns the key-value pair with metadata
+</ResponseField>
+
+## Scan Operations
+
+### scan
+
+```rust
+pub async fn scan<K, T>(&self, range: T) -> Result<DbIterator, Error>
+where
+    K: AsRef<[u8]> + Send,
+    T: RangeBounds<K> + Send,
+```
+
+Scan a range of keys.
+
+<ParamField path="range" type="T: RangeBounds<K>" required>
+  The range of keys to scan
+</ParamField>
+
+<ResponseField name="Result" type="Result<DbIterator, Error>">
+  Returns a `DbIterator` for the scan results
+</ResponseField>
+
+<Info>
+In SSI mode, this operation tracks the read range for phantom read detection.
+</Info>
+
+### scan_with_options
+
+```rust
+pub async fn scan_with_options<K, T>(
+    &self,
+    range: T,
+    options: &ScanOptions,
+) -> Result<DbIterator, Error>
+where
+    K: AsRef<[u8]> + Send,
+    T: RangeBounds<K> + Send,
+```
+
+Scan a range with custom options.
+
+<ParamField path="range" type="T: RangeBounds<K>" required>
+  The range to scan
+</ParamField>
+
+<ParamField path="options" type="&ScanOptions" required>
+  Scan options to use
+</ParamField>
+
+<ResponseField name="Result" type="Result<DbIterator, Error>">
+  Returns an iterator over the results
+</ResponseField>
+
+### scan_prefix
+
+```rust
+pub async fn scan_prefix<P>(&self, prefix: P) -> Result<DbIterator, Error>
+where
+    P: AsRef<[u8]> + Send,
+```
+
+Scan all keys with a common prefix.
+
+<ParamField path="prefix" type="P: AsRef<[u8]>" required>
+  The key prefix to scan
+</ParamField>
+
+<ResponseField name="Result" type="Result<DbIterator, Error>">
+  Returns an iterator over matching keys
+</ResponseField>
+
+### scan_prefix_with_options
+
+```rust
+pub async fn scan_prefix_with_options<P>(
+    &self,
+    prefix: P,
+    options: &ScanOptions,
+) -> Result<DbIterator, Error>
+where
+    P: AsRef<[u8]> + Send,
+```
+
+Scan a prefix with custom options.
+
+<ParamField path="prefix" type="P: AsRef<[u8]>" required>
+  The prefix to scan
+</ParamField>
+
+<ParamField path="options" type="&ScanOptions" required>
+  Scan options to use
+</ParamField>
+
+<ResponseField name="Result" type="Result<DbIterator, Error>">
+  Returns an iterator over the results
+</ResponseField>
+
+## Write Operations
+
+### put
+
+```rust
+pub fn put<K, V>(&self, key: K, value: V) -> Result<(), Error>
+where
+    K: AsRef<[u8]>,
+    V: AsRef<[u8]>,
+```
+
+Put a key-value pair in the transaction.
+
+<ParamField path="key" type="K: AsRef<[u8]>" required>
+  The key to write
+</ParamField>
+
+<ParamField path="value" type="V: AsRef<[u8]>" required>
+  The value to write
+</ParamField>
+
+<ResponseField name="Result" type="Result<(), Error>">
+  Returns `Ok(())` on success
+</ResponseField>
+
+```rust
+let txn = db.begin(IsolationLevel::Snapshot).await?;
+txn.put(b"key", b"value")?;
+txn.commit().await?;
+```
+
+<Info>
+Writes are buffered in the transaction's write batch and applied atomically on commit.
+</Info>
+
+### put_with_options
+
+```rust
+pub fn put_with_options<K, V>(
+    &self,
+    key: K,
+    value: V,
+    options: &PutOptions,
+) -> Result<(), Error>
+where
+    K: AsRef<[u8]>,
+    V: AsRef<[u8]>,
+```
+
+Put a key-value pair with custom options.
+
+<ParamField path="key" type="K: AsRef<[u8]>" required>
+  The key to write
+</ParamField>
+
+<ParamField path="value" type="V: AsRef<[u8]>" required>
+  The value to write
+</ParamField>
+
+<ParamField path="options" type="&PutOptions" required>
+  Put options (e.g., TTL)
+</ParamField>
+
+<ResponseField name="Result" type="Result<(), Error>">
+  Returns `Ok(())` on success
+</ResponseField>
+
+### delete
+
+```rust
+pub fn delete<K: AsRef<[u8]>>(&self, key: K) -> Result<(), Error>
+```
+
+Delete a key from the transaction.
+
+<ParamField path="key" type="K: AsRef<[u8]>" required>
+  The key to delete
+</ParamField>
+
+<ResponseField name="Result" type="Result<(), Error>">
+  Returns `Ok(())` on success
+</ResponseField>
+
+```rust
+txn.delete(b"key")?;
+```
+
+### merge
+
+```rust
+pub fn merge<K, V>(&self, key: K, value: V) -> Result<(), Error>
+where
+    K: AsRef<[u8]>,
+    V: AsRef<[u8]>,
+```
+
+Merge a value into a key.
+
+<ParamField path="key" type="K: AsRef<[u8]>" required>
+  The key to merge into
+</ParamField>
+
+<ParamField path="value" type="V: AsRef<[u8]>" required>
+  The merge operand
+</ParamField>
+
+<ResponseField name="Result" type="Result<(), Error>">
+  Returns `Ok(())` on success
+</ResponseField>
+
+### merge_with_options
+
+```rust
+pub fn merge_with_options<K, V>(
+    &self,
+    key: K,
+    value: V,
+    options: &MergeOptions,
+) -> Result<(), Error>
+where
+    K: AsRef<[u8]>,
+    V: AsRef<[u8]>,
+```
+
+Merge a value with custom options.
+
+<ParamField path="key" type="K: AsRef<[u8]>" required>
+  The key to merge into
+</ParamField>
+
+<ParamField path="value" type="V: AsRef<[u8]>" required>
+  The merge operand
+</ParamField>
+
+<ParamField path="options" type="&MergeOptions" required>
+  Merge options to use
+</ParamField>
+
+<ResponseField name="Result" type="Result<(), Error>">
+  Returns `Ok(())` on success
+</ResponseField>
+
+## Conflict Detection
+
+### mark_read
+
+```rust
+pub fn mark_read<K, I>(&self, keys: I) -> Result<(), Error>
+where
+    K: AsRef<[u8]>,
+    I: IntoIterator<Item = K>,
+```
+
+Explicitly mark keys as read for conflict detection.
+
+<ParamField path="keys" type="I: IntoIterator<Item = K>" required>
+  An iterator of keys to mark as read
+</ParamField>
+
+<ResponseField name="Result" type="Result<(), Error>">
+  Returns `Ok(())` on success
+</ResponseField>
+
+```rust
+txn.mark_read([b"key1", b"key2", b"key3"])?;
+```
+
+<Info>
+This allows selective read-write conflict detection even in Snapshot Isolation mode. The transaction will detect conflicts if another transaction modifies any marked keys.
+</Info>
+
+### unmark_write
+
+```rust
+pub fn unmark_write<K, I>(&self, keys: I) -> Result<(), Error>
+where
+    K: AsRef<[u8]>,
+    I: IntoIterator<Item = K>,
+```
+
+Exclude written keys from conflict detection.
+
+<ParamField path="keys" type="I: IntoIterator<Item = K>" required>
+  An iterator of keys to exclude from conflict tracking
+</ParamField>
+
+<ResponseField name="Result" type="Result<(), Error>">
+  Returns `Ok(())` on success
+</ResponseField>
+
+```rust
+txn.put(b"counter", b"1")?;
+txn.unmark_write([b"counter"])?;
+txn.commit().await?;
+```
+
+<Warning>
+Keys marked with `unmark_write` are still written atomically but are excluded from conflict detection for both this transaction and others.
+</Warning>
+
+## Commit and Rollback
+
+### commit
+
+```rust
+pub async fn commit(self) -> Result<Option<WriteHandle>, Error>
+```
+
+Commit the transaction, applying all buffered operations.
+
+<ResponseField name="Result" type="Result<Option<WriteHandle>, Error>">
+  Returns `Some(WriteHandle)` if there were writes, `None` if the batch was empty
+</ResponseField>
+
+```rust
+let txn = db.begin(IsolationLevel::Snapshot).await?;
+txn.put(b"key", b"value")?;
+let handle = txn.commit().await?;
+```
+
+<Info>
+Conflict detection occurs during commit. The transaction will fail if conflicts are detected.
+</Info>
+
+### commit_with_options
+
+```rust
+pub async fn commit_with_options(
+    self,
+    options: &WriteOptions,
+) -> Result<Option<WriteHandle>, Error>
+```
+
+Commit with custom write options.
+
+<ParamField path="options" type="&WriteOptions" required>
+  Write options to use (e.g., `await_durable`)
+</ParamField>
+
+<ResponseField name="Result" type="Result<Option<WriteHandle>, Error>">
+  Returns `Some(WriteHandle)` if successful and writes exist
+</ResponseField>
+
+### rollback
+
+```rust
+pub fn rollback(self)
+```
+
+Rollback the transaction, discarding all buffered operations.
+
+```rust
+let txn = db.begin(IsolationLevel::Snapshot).await?;
+txn.put(b"key", b"value")?;
+txn.rollback(); // Changes are discarded
+```
+
+<Info>
+Rollback is automatically called when the transaction is dropped without committing.
+</Info>
+
+## Metadata
+
+### seqnum
+
+```rust
+pub fn seqnum(&self) -> u64
+```
+
+Get the sequence number this transaction started at.
+
+<ResponseField name="u64" type="u64">
+  The snapshot sequence number for this transaction
+</ResponseField>
+
+### id
+
+```rust
+pub fn id(&self) -> Uuid
+```
+
+Get the unique transaction ID.
+
+<ResponseField name="Uuid" type="Uuid">
+  The transaction's unique identifier
+</ResponseField>
+
+## Usage Examples
+
+### Basic Transaction
+
+```rust
+use slatedb::{Db, IsolationLevel, Error};
+
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    let db = Db::open("test_db", object_store).await?;
+    
+    let txn = db.begin(IsolationLevel::Snapshot).await?;
+    txn.put(b"key1", b"value1")?;
+    txn.put(b"key2", b"value2")?;
+    txn.delete(b"key3")?;
+    txn.commit().await?;
+    
+    Ok(())
+}
+```
+
+### Read-Write Transaction
+
+```rust
+// Read-modify-write pattern
+let txn = db.begin(IsolationLevel::Snapshot).await?;
+
+if let Some(value) = txn.get(b"counter").await? {
+    let count: i64 = String::from_utf8_lossy(&value).parse()?;
+    let new_count = count + 1;
+    txn.put(b"counter", new_count.to_string().as_bytes())?;
+}
+
+txn.commit().await?;
+```
+
+### Serializable Snapshot Isolation
+
+```rust
+// SSI detects both read-write and write-write conflicts
+let txn = db.begin(IsolationLevel::SerializableSnapshot).await?;
+
+// This read is tracked
+let balance = txn.get(b"account:balance").await?;
+
+// If another transaction modifies the balance after this
+// transaction started, commit will fail
+txn.put(b"account:updated", b"true")?;
+
+let result = txn.commit().await;
+match result {
+    Ok(_) => println!("Transaction committed"),
+    Err(e) => println!("Conflict detected: {}", e),
+}
+```

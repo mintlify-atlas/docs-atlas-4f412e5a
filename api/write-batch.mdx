@@ -1,0 +1,229 @@
+---
+title: WriteBatch
+description: API reference for WriteBatch, a collection of write operations applied atomically
+---
+
+## Overview
+
+A `WriteBatch` is a collection of write operations (puts, deletes, and merges) that are applied atomically to the database. If multiple operations appear for a single key, the last operation will be applied and the others will be dropped.
+
+## Constructor
+
+### new()
+
+Creates a new empty `WriteBatch`.
+
+```rust
+pub fn new() -> Self
+```
+
+#### Returns
+
+A new empty `WriteBatch`.
+
+#### Example
+
+```rust
+use slatedb::WriteBatch;
+
+let mut batch = WriteBatch::new();
+batch.put(b"key1", b"value1");
+batch.put(b"key2", b"value2");
+batch.delete(b"key3");
+```
+
+## Methods
+
+### put()
+
+Puts a key-value pair into the batch with default options.
+
+```rust
+pub fn put<K, V>(&mut self, key: K, value: V)
+where
+    K: AsRef<[u8]>,
+    V: AsRef<[u8]>,
+```
+
+<ParamField path="key" type="K: AsRef<[u8]>" required>
+  The key to insert. Must not be empty and must be ≤ u16::MAX bytes.
+</ParamField>
+
+<ParamField path="value" type="V: AsRef<[u8]>" required>
+  The value to insert. Must be ≤ u32::MAX bytes.
+</ParamField>
+
+#### Panics
+
+- If the key is empty
+- If the key size is larger than u16::MAX
+- If the value size is larger than u32::MAX
+
+#### Example
+
+```rust
+let mut batch = WriteBatch::new();
+batch.put(b"key1", b"value1");
+batch.put(b"key2", b"value2");
+```
+
+### put_with_options()
+
+Puts a key-value pair into the batch with custom options.
+
+```rust
+pub fn put_with_options<K, V>(&mut self, key: K, value: V, options: &PutOptions)
+where
+    K: AsRef<[u8]>,
+    V: AsRef<[u8]>,
+```
+
+<ParamField path="key" type="K: AsRef<[u8]>" required>
+  The key to insert. Must not be empty and must be ≤ u16::MAX bytes.
+</ParamField>
+
+<ParamField path="value" type="V: AsRef<[u8]>" required>
+  The value to insert. Must be ≤ u32::MAX bytes.
+</ParamField>
+
+<ParamField path="options" type="&PutOptions" required>
+  Options controlling the put operation, such as TTL settings.
+</ParamField>
+
+#### Example
+
+```rust
+use slatedb::{WriteBatch, PutOptions, Ttl};
+
+let mut batch = WriteBatch::new();
+let options = PutOptions {
+    ttl: Ttl::ExpireAfter(3600), // expire after 1 hour
+};
+batch.put_with_options(b"key1", b"value1", &options);
+```
+
+### merge()
+
+Merges a key-value pair into the batch with default options.
+
+```rust
+pub fn merge<K, V>(&mut self, key: K, value: V)
+where
+    K: AsRef<[u8]>,
+    V: AsRef<[u8]>,
+```
+
+<ParamField path="key" type="K: AsRef<[u8]>" required>
+  The key to merge. Must not be empty and must be ≤ u16::MAX bytes.
+</ParamField>
+
+<ParamField path="value" type="V: AsRef<[u8]>" required>
+  The merge operand. Must be ≤ u32::MAX bytes.
+</ParamField>
+
+<Note>
+Merge operations require a merge operator to be configured on the database. Multiple merge operations for the same key are preserved and will be combined during reads and compactions.
+</Note>
+
+#### Example
+
+```rust
+let mut batch = WriteBatch::new();
+batch.merge(b"counter", b"1");
+batch.merge(b"counter", b"2");
+batch.merge(b"counter", b"3");
+// All three merge operands are preserved
+```
+
+### merge_with_options()
+
+Merges a key-value pair into the batch with custom options.
+
+```rust
+pub fn merge_with_options<K, V>(&mut self, key: K, value: V, options: &MergeOptions)
+where
+    K: AsRef<[u8]>,
+    V: AsRef<[u8]>,
+```
+
+<ParamField path="key" type="K: AsRef<[u8]>" required>
+  The key to merge. Must not be empty and must be ≤ u16::MAX bytes.
+</ParamField>
+
+<ParamField path="value" type="V: AsRef<[u8]>" required>
+  The merge operand. Must be ≤ u32::MAX bytes.
+</ParamField>
+
+<ParamField path="options" type="&MergeOptions" required>
+  Options controlling the merge operation, such as TTL settings.
+</ParamField>
+
+### delete()
+
+Deletes a key from the batch.
+
+```rust
+pub fn delete<K: AsRef<[u8]>>(&mut self, key: K)
+```
+
+<ParamField path="key" type="K: AsRef<[u8]>" required>
+  The key to delete. Must not be empty and must be ≤ u16::MAX bytes.
+</ParamField>
+
+#### Example
+
+```rust
+let mut batch = WriteBatch::new();
+batch.delete(b"key1");
+```
+
+### is_empty()
+
+Returns whether the batch contains any operations.
+
+```rust
+pub fn is_empty(&self) -> bool
+```
+
+#### Returns
+
+`true` if the batch contains no operations, `false` otherwise.
+
+## Usage Notes
+
+### Deduplication
+
+Put and delete operations deduplicate by key. If you issue multiple put or delete operations for the same key, only the last one will be retained:
+
+```rust
+let mut batch = WriteBatch::new();
+batch.put(b"key1", b"value1");
+batch.put(b"key1", b"value2"); // Overwrites previous put
+// Only the second put is retained
+```
+
+Merge operations do NOT deduplicate. Multiple merge operations for the same key are preserved:
+
+```rust
+let mut batch = WriteBatch::new();
+batch.merge(b"key1", b"merge1");
+batch.merge(b"key1", b"merge2");
+batch.merge(b"key1", b"merge3");
+// All three merge operations are preserved
+```
+
+### Unlimited Size
+
+The `WriteBatch` has an unlimited size. This means that batch writes can exceed `l0_sst_size_bytes` (when WAL is disabled). It also means that WAL SSTs could get large if there's a large batch write.
+
+### Mixed Operations
+
+When a put or delete is added after merge operations for the same key, all previous merge operations for that key are removed:
+
+```rust
+let mut batch = WriteBatch::new();
+batch.merge(b"key1", b"merge1");
+batch.merge(b"key1", b"merge2");
+batch.put(b"key1", b"value"); // Removes previous merges
+// Only the put operation is retained
+```

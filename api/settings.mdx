@@ -1,0 +1,454 @@
+---
+title: Settings
+description: API reference for Settings, the configuration options for SlateDB
+---
+
+## Overview
+
+`Settings` (also aliased as `DBOptions`) represents the configuration options for customizing the database engine. This includes flush behavior, compaction settings, cache configuration, and garbage collection options.
+
+## Configuration Loading
+
+### default()
+
+Creates a `Settings` instance with default values.
+
+```rust
+impl Default for Settings
+```
+
+#### Example
+
+```rust
+use slatedb::config::Settings;
+
+let settings = Settings::default();
+```
+
+### from_file()
+
+Loads `Settings` from a configuration file.
+
+```rust
+pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Settings, Error>
+```
+
+<ParamField path="path" type="P: AsRef<Path>" required>
+  Path to the configuration file. Supported formats: `.json`, `.toml`, `.yaml`, `.yml`.
+</ParamField>
+
+#### Returns
+
+`Ok(Settings)` if successful, or an error if the file cannot be read or parsed.
+
+#### Example
+
+```rust
+use slatedb::config::Settings;
+
+let settings = Settings::from_file("config.toml")?;
+```
+
+### from_env()
+
+Loads `Settings` from environment variables with a specified prefix.
+
+```rust
+pub fn from_env(prefix: &str) -> Result<Settings, Error>
+```
+
+<ParamField path="prefix" type="&str" required>
+  The prefix for environment variables (e.g., "SLATEDB_").
+</ParamField>
+
+<Note>
+Nested options are separated by a dot (`.`) in environment variable names. For example, `SLATEDB_OBJECT_STORE_CACHE_OPTIONS.ROOT_FOLDER` corresponds to the `root_folder` field within `ObjectStoreCacheOptions`.
+</Note>
+
+#### Example
+
+```rust
+use slatedb::config::Settings;
+
+// Assumes environment variables like SLATEDB_FLUSH_INTERVAL are set
+let settings = Settings::from_env("SLATEDB_")?;
+```
+
+### load()
+
+Loads `Settings` from multiple configuration sources in order of precedence.
+
+```rust
+pub fn load() -> Result<Settings, Error>
+```
+
+Configuration sources (in order of precedence):
+1. Default options
+2. `SlateDb.json`
+3. `SlateDb.toml`
+4. `SlateDb.yaml` / `SlateDb.yml`
+5. Environment variables prefixed with `SLATEDB_`
+
+#### Example
+
+```rust
+use slatedb::config::Settings;
+
+let settings = Settings::load()?;
+```
+
+## Core Settings
+
+### flush_interval
+
+How frequently to flush the write-ahead log to object storage.
+
+<ParamField path="flush_interval" type="Option<Duration>">
+  Duration between WAL flushes. `None` disables automatic flushing.
+  
+  **Default:** `Some(Duration::from_millis(100))`
+</ParamField>
+
+**Considerations:**
+- **Latency:** Higher flush intervals increase write commit latency
+- **API cost:** Lower flush intervals result in more PUT calls to object storage
+
+**Example:** A 100ms flush interval costs approximately $130/month in S3 PUT costs.
+
+### manifest_poll_interval
+
+How frequently to poll for new manifest files.
+
+<ParamField path="manifest_poll_interval" type="Duration" required>
+  Duration between manifest polls.
+  
+  **Default:** `Duration::from_secs(1)`
+</ParamField>
+
+Refreshing the manifest allows the database to detect fencing operations and newly compacted data.
+
+### manifest_update_timeout
+
+The maximum time to wait for a manifest update before giving up.
+
+<ParamField path="manifest_update_timeout" type="Duration" required>
+  Timeout for manifest updates.
+  
+  **Default:** `Duration::from_secs(300)`
+</ParamField>
+
+### min_filter_keys
+
+Write SSTables with a bloom filter if the number of keys is greater than or equal to this value.
+
+<ParamField path="min_filter_keys" type="u32" required>
+  Minimum number of keys for bloom filter creation.
+  
+  **Default:** `1000`
+</ParamField>
+
+### filter_bits_per_key
+
+The number of bits to use per key for bloom filters.
+
+<ParamField path="filter_bits_per_key" type="u32" required>
+  Bits per key in bloom filters.
+  
+  **Default:** `10`
+</ParamField>
+
+With 10 bits per key, the expected false positive probability is ~0.0082 per sorted run.
+
+### l0_sst_size_bytes
+
+The minimum size a memtable needs to be before it is frozen and flushed to L0 object storage.
+
+<ParamField path="l0_sst_size_bytes" type="usize" required>
+  Minimum memtable size in bytes before flush.
+  
+  **Default:** `67108864` (64 MiB)
+</ParamField>
+
+**Considerations:**
+- **Recovery time:** Larger thresholds mean more WAL data to replay on restart
+- **Number of L0 SSTs:** Smaller thresholds create more L0 SSTables
+- **Memory usage:** Larger thresholds increase in-memory memtable size
+- **Secondary reader latency:** Larger thresholds delay data visibility to secondary readers
+
+### l0_max_ssts
+
+Maximum number of SSTs in L0. Memtables will not be flushed if this limit is reached until compaction reduces the count.
+
+<ParamField path="l0_max_ssts" type="usize" required>
+  Maximum L0 SST count.
+  
+  **Default:** `8`
+</ParamField>
+
+### max_unflushed_bytes
+
+Maximum number of unflushed key/value pair bytes in memory before applying backpressure to writers.
+
+<ParamField path="max_unflushed_bytes" type="usize" required>
+  Maximum unflushed bytes.
+  
+  **Default:** `1073741824` (1 GiB)
+</ParamField>
+
+This includes both the immutable WAL flush queue and immutable memtable flush queue.
+
+### default_ttl
+
+The default time-to-live (TTL) for insertions in seconds.
+
+<ParamField path="default_ttl" type="Option<u64>">
+  Default TTL in seconds. `None` means no expiration.
+  
+  **Default:** `None`
+</ParamField>
+
+## Compaction Settings
+
+### compactor_options
+
+Configuration options for the compactor.
+
+<ParamField path="compactor_options" type="Option<CompactorOptions>">
+  Compactor configuration.
+  
+  **Default:** `Some(CompactorOptions::default())`
+</ParamField>
+
+<Note>
+`compactor_options` is mutually exclusive with `DbBuilder::with_compactor_builder`. Setting both will result in an error.
+</Note>
+
+#### CompactorOptions Fields
+
+<ResponseField name="poll_interval" type="Duration">
+  Interval for checking the manifest and scheduling compactions.
+  
+  **Default:** `Duration::from_secs(5)`
+</ResponseField>
+
+<ResponseField name="manifest_update_timeout" type="Duration">
+  Timeout for manifest update retries.
+  
+  **Default:** `Duration::from_secs(300)`
+</ResponseField>
+
+<ResponseField name="max_sst_size" type="usize">
+  Maximum size of a compacted SSTable in bytes.
+  
+  **Default:** `268435456` (256 MiB)
+</ResponseField>
+
+<ResponseField name="max_concurrent_compactions" type="usize">
+  Maximum number of concurrent compaction tasks.
+  
+  **Default:** `4`
+</ResponseField>
+
+<ResponseField name="scheduler_options" type="HashMap<String, String>">
+  Scheduler-specific options as string key/value pairs.
+  
+  **Default:** `HashMap::new()`
+</ResponseField>
+
+## Garbage Collection Settings
+
+### garbage_collector_options
+
+Configuration options for the garbage collector.
+
+<ParamField path="garbage_collector_options" type="Option<GarbageCollectorOptions>">
+  Garbage collector configuration.
+  
+  **Default:** `Some(GarbageCollectorOptions::default())`
+</ParamField>
+
+#### GarbageCollectorOptions Fields
+
+<ResponseField name="manifest_options" type="Option<GarbageCollectorDirectoryOptions>">
+  GC options for the manifest directory.
+  
+  **Default:** `Some(GarbageCollectorDirectoryOptions::default())`
+</ResponseField>
+
+<ResponseField name="wal_options" type="Option<GarbageCollectorDirectoryOptions>">
+  GC options for the WAL directory.
+  
+  **Default:** `Some(GarbageCollectorDirectoryOptions::default())`
+</ResponseField>
+
+<ResponseField name="compacted_options" type="Option<GarbageCollectorDirectoryOptions>">
+  GC options for the compacted directory.
+  
+  **Default:** `Some(GarbageCollectorDirectoryOptions::default())`
+</ResponseField>
+
+<ResponseField name="compactions_options" type="Option<GarbageCollectorDirectoryOptions>">
+  GC options for the compactions directory.
+  
+  **Default:** `Some(GarbageCollectorDirectoryOptions::default())`
+</ResponseField>
+
+#### GarbageCollectorDirectoryOptions Fields
+
+<ResponseField name="interval" type="Option<Duration>">
+  Interval for background GC runs. `None` disables recurring GC.
+  
+  **Default:** `Some(Duration::from_secs(60))`
+</ResponseField>
+
+<ResponseField name="min_age" type="Duration">
+  Minimum age of a file before it can be garbage collected.
+  
+  **Default:** `Duration::from_secs(300)`
+</ResponseField>
+
+## Cache Settings
+
+### object_store_cache_options
+
+Options for the local disk cache.
+
+<ParamField path="object_store_cache_options" type="ObjectStoreCacheOptions" required>
+  Disk cache configuration.
+</ParamField>
+
+#### ObjectStoreCacheOptions Fields
+
+<ResponseField name="root_folder" type="Option<PathBuf>">
+  Root folder for cache files. If `None`, caching is disabled.
+  
+  **Default:** `None`
+</ResponseField>
+
+<ResponseField name="max_cache_size_bytes" type="Option<usize>">
+  Maximum cache size in bytes.
+  
+  **Default:** `Some(17179869184)` (16 GiB on 64-bit systems)
+</ResponseField>
+
+<ResponseField name="part_size_bytes" type="usize">
+  Size of each cache part in bytes. Must be aligned with 1KB.
+  
+  **Default:** `4194304` (4 MiB)
+</ResponseField>
+
+<ResponseField name="cache_puts" type="bool">
+  Whether to cache PUT operations to disk.
+  
+  **Default:** `false`
+</ResponseField>
+
+<ResponseField name="preload_disk_cache_on_startup" type="Option<PreloadLevel>">
+  Whether to preload SST files into cache during startup.
+  
+  **Default:** `None`
+  
+  Options:
+  - `PreloadLevel::L0Sst` - Preload only L0 SSTs
+  - `PreloadLevel::AllSst` - Preload all SSTs
+</ResponseField>
+
+<ResponseField name="scan_interval" type="Option<Duration>">
+  Interval to scan the cache directory to rebuild the in-memory evictor map.
+  
+  **Default:** `Some(Duration::from_secs(3600))`
+</ResponseField>
+
+## Compression Settings
+
+### compression_codec
+
+The compression algorithm to use for SSTables.
+
+<ParamField path="compression_codec" type="Option<CompressionCodec>">
+  Compression codec.
+  
+  **Default:** `None`
+  
+  Options:
+  - `CompressionCodec::Snappy` (requires `snappy` feature)
+  - `CompressionCodec::Zlib` (requires `zlib` feature)
+  - `CompressionCodec::Lz4` (requires `lz4` feature)
+  - `CompressionCodec::Zstd` (requires `zstd` feature)
+</ParamField>
+
+## Merge Operator
+
+### merge_operator
+
+The merge operator to use for the database.
+
+<ParamField path="merge_operator" type="Option<MergeOperatorType>">
+  Merge operator implementation. If not set, merge operations are not supported.
+  
+  **Default:** `None`
+</ParamField>
+
+The merge operator allows applications to express partial updates using an associative operator, avoiding read-modify-write cycles.
+
+## Configuration File Examples
+
+### TOML Example
+
+```toml
+flush_interval = "100ms"
+manifest_poll_interval = "1s"
+manifest_update_timeout = "300s"
+min_filter_keys = 1000
+filter_bits_per_key = 10
+l0_sst_size_bytes = 67108864
+l0_max_ssts = 8
+max_unflushed_bytes = 536870912
+
+[compactor_options]
+poll_interval = "5s"
+max_sst_size = 268435456
+max_concurrent_compactions = 4
+
+[object_store_cache_options]
+root_folder = "/tmp/slatedb-cache"
+max_cache_size_bytes = 17179869184
+part_size_bytes = 4194304
+```
+
+### JSON Example
+
+```json
+{
+  "flush_interval": "100ms",
+  "manifest_poll_interval": "1s",
+  "manifest_update_timeout": "300s",
+  "min_filter_keys": 1000,
+  "filter_bits_per_key": 10,
+  "l0_sst_size_bytes": 67108864,
+  "l0_max_ssts": 8,
+  "max_unflushed_bytes": 536870912,
+  "compactor_options": {
+    "poll_interval": "5s",
+    "max_sst_size": 268435456,
+    "max_concurrent_compactions": 4
+  }
+}
+```
+
+### YAML Example
+
+```yaml
+flush_interval: '100ms'
+manifest_poll_interval: '1s'
+manifest_update_timeout: '300s'
+min_filter_keys: 1000
+filter_bits_per_key: 10
+l0_sst_size_bytes: 67108864
+l0_max_ssts: 8
+max_unflushed_bytes: 536870912
+compactor_options:
+  poll_interval: '5s'
+  max_sst_size: 268435456
+  max_concurrent_compactions: 4
+```

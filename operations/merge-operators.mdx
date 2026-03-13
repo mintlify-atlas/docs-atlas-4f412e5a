@@ -1,0 +1,489 @@
+---
+title: Merge Operators
+description: Implement custom aggregation and update operations without read-modify-write cycles
+---
+
+Merge operators allow you to express updates as associative operations, bypassing the traditional read-modify-write cycle. This is essential for high-performance scenarios like counters, aggregations, and append-only data structures.
+
+## Why Merge Operators?
+
+Traditional updates require reading, modifying, and writing back:
+
+```rust
+// Traditional approach - requires read
+let value = db.get(b"counter").await?;
+let count = value.map(|v| u64::from_le_bytes(...)).unwrap_or(0);
+db.put(b"counter", &(count + 1).to_le_bytes()).await?;
+```
+
+With merge operators, express the update directly:
+
+```rust
+// Merge operator approach - no read needed
+db.merge(b"counter", &1u64.to_le_bytes()).await?;
+```
+
+<Note>
+  Merge operators are applied lazily during reads and compaction, making writes extremely fast.
+</Note>
+
+## Implementing a Merge Operator
+
+### The MergeOperator Trait
+
+Implement the `MergeOperator` trait:
+
+```rust
+use bytes::Bytes;
+use slatedb::{MergeOperator, MergeOperatorError};
+
+struct CounterMergeOperator;
+
+impl MergeOperator for CounterMergeOperator {
+    fn merge(
+        &self,
+        _key: &Bytes,
+        existing_value: Option<Bytes>,
+        operand: Bytes,
+    ) -> Result<Bytes, MergeOperatorError> {
+        let existing = existing_value
+            .map(|v| u64::from_le_bytes(v.as_ref().try_into().unwrap()))
+            .unwrap_or(0);
+        let increment = u64::from_le_bytes(operand.as_ref().try_into().unwrap());
+        Ok(Bytes::copy_from_slice(&(existing + increment).to_le_bytes()))
+    }
+
+    fn merge_batch(
+        &self,
+        _key: &Bytes,
+        existing_value: Option<Bytes>,
+        operands: &[Bytes],
+    ) -> Result<Bytes, MergeOperatorError> {
+        let mut total = existing_value
+            .map(|v| u64::from_le_bytes(v.as_ref().try_into().unwrap()))
+            .unwrap_or(0);
+
+        for operand in operands {
+            let increment = u64::from_le_bytes(operand.as_ref().try_into().unwrap());
+            total += increment;
+        }
+
+        Ok(Bytes::copy_from_slice(&total.to_le_bytes()))
+    }
+}
+```
+
+### Associativity Requirement
+
+<Warning>
+  Your merge operator MUST be associative:
+  
+  `merge(merge(a, b), c) == merge(a, merge(b, c))`
+  
+  Non-associative operators will produce incorrect results.
+</Warning>
+
+## Configuring a Merge Operator
+
+Register your merge operator when opening the database:
+
+```rust
+use std::sync::Arc;
+use slatedb::Db;
+
+let db = Db::builder("my_db", object_store)
+    .with_merge_operator(Arc::new(CounterMergeOperator))
+    .build()
+    .await?;
+```
+
+<Note>
+  Only one merge operator can be configured per database. Use key prefixes to route different operations.
+</Note>
+
+## Using Merge Operations
+
+### Basic Merge
+
+Merge a value into a key:
+
+```rust
+// Increment counter
+db.merge(b"page_views", &1u64.to_le_bytes()).await?;
+db.merge(b"page_views", &5u64.to_le_bytes()).await?;
+
+// Read merged result
+let value = db.get(b"page_views").await?.unwrap();
+let count = u64::from_le_bytes(value.as_ref().try_into().unwrap());
+assert_eq!(count, 6);
+```
+
+### Merge with Options
+
+```rust
+use slatedb::config::{MergeOptions, WriteOptions};
+
+db.merge_with_options(
+    b"counter",
+    &1u64.to_le_bytes(),
+    &MergeOptions::default(),
+    &WriteOptions::default(),
+).await?;
+```
+
+### Merge in Transactions
+
+Use merge operations within transactions:
+
+```rust
+use slatedb::IsolationLevel;
+
+let txn = db.begin(IsolationLevel::Snapshot).await?;
+
+txn.merge(b"cart:total", &price.to_le_bytes())?;
+txn.merge(b"cart:items", &1u64.to_le_bytes())?;
+
+txn.commit().await?;
+```
+
+## Common Merge Operator Patterns
+
+### Counter (Addition)
+
+```rust
+struct CounterMergeOperator;
+
+impl MergeOperator for CounterMergeOperator {
+    fn merge(
+        &self,
+        _key: &Bytes,
+        existing_value: Option<Bytes>,
+        operand: Bytes,
+    ) -> Result<Bytes, MergeOperatorError> {
+        let existing = existing_value
+            .map(|v| u64::from_le_bytes(v.as_ref().try_into().unwrap()))
+            .unwrap_or(0);
+        let increment = u64::from_le_bytes(operand.as_ref().try_into().unwrap());
+        Ok(Bytes::copy_from_slice(&(existing + increment).to_le_bytes()))
+    }
+
+    fn merge_batch(
+        &self,
+        _key: &Bytes,
+        existing_value: Option<Bytes>,
+        operands: &[Bytes],
+    ) -> Result<Bytes, MergeOperatorError> {
+        let mut total = existing_value
+            .map(|v| u64::from_le_bytes(v.as_ref().try_into().unwrap()))
+            .unwrap_or(0);
+        for operand in operands {
+            total += u64::from_le_bytes(operand.as_ref().try_into().unwrap());
+        }
+        Ok(Bytes::copy_from_slice(&total.to_le_bytes()))
+    }
+}
+```
+
+### Max Value
+
+```rust
+struct MaxMergeOperator;
+
+impl MergeOperator for MaxMergeOperator {
+    fn merge(
+        &self,
+        _key: &Bytes,
+        existing_value: Option<Bytes>,
+        operand: Bytes,
+    ) -> Result<Bytes, MergeOperatorError> {
+        let existing = existing_value
+            .map(|v| u64::from_le_bytes(v.as_ref().try_into().unwrap()))
+            .unwrap_or(0);
+        let new_value = u64::from_le_bytes(operand.as_ref().try_into().unwrap());
+        Ok(Bytes::copy_from_slice(&existing.max(new_value).to_le_bytes()))
+    }
+
+    fn merge_batch(
+        &self,
+        _key: &Bytes,
+        existing_value: Option<Bytes>,
+        operands: &[Bytes],
+    ) -> Result<Bytes, MergeOperatorError> {
+        let mut max = existing_value
+            .map(|v| u64::from_le_bytes(v.as_ref().try_into().unwrap()))
+            .unwrap_or(0);
+        for operand in operands {
+            let val = u64::from_le_bytes(operand.as_ref().try_into().unwrap());
+            max = max.max(val);
+        }
+        Ok(Bytes::copy_from_slice(&max.to_le_bytes()))
+    }
+}
+```
+
+### String Concatenation
+
+```rust
+struct StringConcatMergeOperator;
+
+impl MergeOperator for StringConcatMergeOperator {
+    fn merge(
+        &self,
+        _key: &Bytes,
+        existing_value: Option<Bytes>,
+        operand: Bytes,
+    ) -> Result<Bytes, MergeOperatorError> {
+        let mut result = existing_value.unwrap_or_default().to_vec();
+        result.extend_from_slice(&operand);
+        Ok(Bytes::from(result))
+    }
+
+    fn merge_batch(
+        &self,
+        _key: &Bytes,
+        existing_value: Option<Bytes>,
+        operands: &[Bytes],
+    ) -> Result<Bytes, MergeOperatorError> {
+        let mut result = existing_value.unwrap_or_default().to_vec();
+        for operand in operands {
+            result.extend_from_slice(operand);
+        }
+        Ok(Bytes::from(result))
+    }
+}
+```
+
+### List Append
+
+```rust
+use serde::{Serialize, Deserialize};
+
+#[derive(Serialize, Deserialize)]
+struct Item {
+    id: u64,
+    value: String,
+}
+
+struct ListAppendMergeOperator;
+
+impl MergeOperator for ListAppendMergeOperator {
+    fn merge(
+        &self,
+        _key: &Bytes,
+        existing_value: Option<Bytes>,
+        operand: Bytes,
+    ) -> Result<Bytes, MergeOperatorError> {
+        let mut list: Vec<Item> = existing_value
+            .map(|v| bincode::deserialize(&v).unwrap())
+            .unwrap_or_default();
+        
+        let new_item: Item = bincode::deserialize(&operand).unwrap();
+        list.push(new_item);
+        
+        Ok(Bytes::from(bincode::serialize(&list).unwrap()))
+    }
+
+    fn merge_batch(
+        &self,
+        _key: &Bytes,
+        existing_value: Option<Bytes>,
+        operands: &[Bytes],
+    ) -> Result<Bytes, MergeOperatorError> {
+        let mut list: Vec<Item> = existing_value
+            .map(|v| bincode::deserialize(&v).unwrap())
+            .unwrap_or_default();
+        
+        for operand in operands {
+            let item: Item = bincode::deserialize(operand).unwrap();
+            list.push(item);
+        }
+        
+        Ok(Bytes::from(bincode::serialize(&list).unwrap()))
+    }
+}
+```
+
+## Key-Based Routing
+
+Use a single merge operator for multiple operations:
+
+```rust
+struct RoutingMergeOperator;
+
+impl MergeOperator for RoutingMergeOperator {
+    fn merge(
+        &self,
+        key: &Bytes,
+        existing_value: Option<Bytes>,
+        operand: Bytes,
+    ) -> Result<Bytes, MergeOperatorError> {
+        if key.starts_with(b"counter:") {
+            // Counter logic
+            let existing = existing_value
+                .map(|v| u64::from_le_bytes(v.as_ref().try_into().unwrap()))
+                .unwrap_or(0);
+            let increment = u64::from_le_bytes(operand.as_ref().try_into().unwrap());
+            Ok(Bytes::copy_from_slice(&(existing + increment).to_le_bytes()))
+        } else if key.starts_with(b"max:") {
+            // Max logic
+            let existing = existing_value
+                .map(|v| u64::from_le_bytes(v.as_ref().try_into().unwrap()))
+                .unwrap_or(0);
+            let new_value = u64::from_le_bytes(operand.as_ref().try_into().unwrap());
+            Ok(Bytes::copy_from_slice(&existing.max(new_value).to_le_bytes()))
+        } else {
+            // Default: concatenation
+            let mut result = existing_value.unwrap_or_default().to_vec();
+            result.extend_from_slice(&operand);
+            Ok(Bytes::from(result))
+        }
+    }
+    
+    // Also implement merge_batch with routing logic...
+}
+```
+
+## Batch Merging
+
+The `merge_batch` method allows efficient bulk operations:
+
+```rust
+fn merge_batch(
+    &self,
+    _key: &Bytes,
+    existing_value: Option<Bytes>,
+    operands: &[Bytes],
+) -> Result<Bytes, MergeOperatorError> {
+    // Efficient: sum all at once
+    let mut total = existing_value
+        .map(|v| u64::from_le_bytes(v.as_ref().try_into().unwrap()))
+        .unwrap_or(0);
+    
+    for operand in operands {
+        let increment = u64::from_le_bytes(operand.as_ref().try_into().unwrap());
+        total += increment;
+    }
+    
+    Ok(Bytes::copy_from_slice(&total.to_le_bytes()))
+}
+```
+
+<Note>
+  Operands are passed to `merge_batch` in order from oldest to newest, collected in batches of up to 100 entries.
+</Note>
+
+## Error Handling
+
+Merge operators can return errors:
+
+```rust
+impl MergeOperator for MyMergeOperator {
+    fn merge(
+        &self,
+        _key: &Bytes,
+        existing_value: Option<Bytes>,
+        operand: Bytes,
+    ) -> Result<Bytes, MergeOperatorError> {
+        if operand.len() != 8 {
+            return Err(MergeOperatorError::EmptyBatch);
+        }
+        // ... merge logic
+    }
+}
+```
+
+<Warning>
+  If a merge operator returns an error during reads or compaction, it will propagate to the caller. Ensure your merge operator is robust.
+</Warning>
+
+## Complete Example: Analytics Counter
+
+```rust
+use slatedb::{Db, MergeOperator, MergeOperatorError};
+use bytes::Bytes;
+use std::sync::Arc;
+
+struct AnalyticsMergeOperator;
+
+impl MergeOperator for AnalyticsMergeOperator {
+    fn merge(
+        &self,
+        _key: &Bytes,
+        existing_value: Option<Bytes>,
+        operand: Bytes,
+    ) -> Result<Bytes, MergeOperatorError> {
+        let existing = existing_value
+            .map(|v| u64::from_le_bytes(v.as_ref().try_into().unwrap()))
+            .unwrap_or(0);
+        let increment = u64::from_le_bytes(operand.as_ref().try_into().unwrap());
+        Ok(Bytes::copy_from_slice(&(existing + increment).to_le_bytes()))
+    }
+
+    fn merge_batch(
+        &self,
+        _key: &Bytes,
+        existing_value: Option<Bytes>,
+        operands: &[Bytes],
+    ) -> Result<Bytes, MergeOperatorError> {
+        let mut total = existing_value
+            .map(|v| u64::from_le_bytes(v.as_ref().try_into().unwrap()))
+            .unwrap_or(0);
+        for operand in operands {
+            total += u64::from_le_bytes(operand.as_ref().try_into().unwrap());
+        }
+        Ok(Bytes::copy_from_slice(&total.to_le_bytes()))
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<(), slatedb::Error> {
+    let object_store = Arc::new(InMemory::new());
+    let db = Db::builder("analytics", object_store)
+        .with_merge_operator(Arc::new(AnalyticsMergeOperator))
+        .build()
+        .await?;
+    
+    // Track page views
+    db.merge(b"page:home:views", &1u64.to_le_bytes()).await?;
+    db.merge(b"page:home:views", &1u64.to_le_bytes()).await?;
+    db.merge(b"page:home:views", &3u64.to_le_bytes()).await?;
+    
+    // Read total
+    let total = db.get(b"page:home:views").await?.unwrap();
+    let count = u64::from_le_bytes(total.as_ref().try_into().unwrap());
+    println!("Total views: {}", count);  // 5
+    
+    Ok(())
+}
+```
+
+## Best Practices
+
+<Steps>
+  <Step title="Ensure Associativity">
+    Test your merge operator thoroughly to ensure it's truly associative.
+  </Step>
+  
+  <Step title="Optimize merge_batch">
+    Provide an efficient `merge_batch` implementation for better performance.
+  </Step>
+  
+  <Step title="Handle Edge Cases">
+    Consider empty values, maximum sizes, and invalid operands.
+  </Step>
+  
+  <Step title="Use Key Prefixes for Routing">
+    Route different operations based on key prefixes to use a single operator.
+  </Step>
+</Steps>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Transactions" icon="arrows-rotate" href="/operations/transactions">
+    Use merge operations within transactions
+  </Card>
+  <Card title="Basic Operations" icon="database" href="/operations/basic-operations">
+    Learn about standard put and get operations
+  </Card>
+</CardGroup>

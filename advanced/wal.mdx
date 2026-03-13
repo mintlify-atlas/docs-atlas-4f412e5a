@@ -1,0 +1,446 @@
+---
+title: Write-Ahead Log (WAL)
+description: Understanding SlateDB's write-ahead log for durability and recovery
+---
+
+The Write-Ahead Log (WAL) ensures durability in SlateDB by persisting writes to object storage before acknowledging them to clients. The WAL enables recovery after crashes and provides a foundation for features like change data capture.
+
+## Overview
+
+SlateDB's WAL implementation consists of:
+
+- **WalBuffer**: In-memory queue of pending writes
+- **WAL SSTs**: Persisted log files in object storage
+- **Replay**: Recovery mechanism that reconstructs state from WAL files
+
+```
+┌──────────────┐
+│   Writes     │
+└──────┬───────┘
+       │
+       ▼
+┌──────────────────────────────────────┐
+│  WalBuffer (in-memory queue)         │
+│  ┌────┐ ┌────┐ ┌────┐               │
+│  │ E1 │→│ E2 │→│ E3 │→ ...          │
+│  └────┘ └────┘ └────┘               │
+└──────┬───────────────────────────────┘
+       │ Flush when:
+       │  - Size > max_wal_bytes_size
+       │  - Time > max_flush_interval
+       │  - Explicit flush() call
+       ▼
+┌──────────────────────────────────────┐
+│  Object Storage (WAL SSTs)           │
+│  wal/001.sst, wal/002.sst, ...       │
+└──────────────────────────────────────┘
+```
+
+## WAL Buffer
+
+The `WalBuffer` (`wal_buffer.rs:82-518`) is an in-memory FIFO queue that batches writes before flushing to object storage.
+
+### Write Flow
+
+1. **Append**: Entries are added to the current WAL buffer
+2. **Freeze**: When size or time threshold is exceeded, buffer becomes immutable
+3. **Flush**: Immutable buffers are written to object storage as WAL SSTs
+4. **Notify**: Waiting writers are notified when their writes are durable
+
+**Implementation** (`wal_buffer.rs:214-267`):
+
+```rust
+pub fn append(&self, entries: &[RowEntry]) 
+    -> Result<WatchableOnceCellReader<Result<(), SlateDBError>>, SlateDBError> 
+{
+    let mut inner = self.inner.write();
+    for entry in entries {
+        inner.current_wal.append(entry.clone());
+    }
+    Ok(inner.current_wal.durable_watcher())
+}
+
+pub fn maybe_trigger_flush(&self) 
+    -> Result<WatchableOnceCellReader<Result<(), SlateDBError>>, SlateDBError> 
+{
+    let inner = self.inner.read();
+    let current_wal_size = self.table_store
+        .estimate_encoded_size_wal(inner.current_wal.len(), inner.current_wal.size());
+    
+    if current_wal_size >= self.max_wal_bytes_size {
+        // Trigger flush
+        flush_tx.send(WalFlushWork { result_tx: None })?;
+    }
+    
+    Ok(inner.current_wal.durable_watcher())
+}
+```
+
+### Durability Guarantees
+
+WAL provides different durability guarantees based on write options:
+
+```rust
+// Best-effort durability (default)
+db.put_with_options(
+    b"key",
+    b"value",
+    &PutOptions::default(),
+    &WriteOptions { await_durable: false },
+).await?;
+// Returns immediately, write buffered in memory
+
+// Guaranteed durability
+db.put_with_options(
+    b"key",
+    b"value",
+    &PutOptions::default(),
+    &WriteOptions { await_durable: true },
+).await?;
+// Returns only after WAL is flushed to object storage
+```
+
+### Flush Triggers
+
+WAL is flushed when:
+
+1. **Size Limit**: Current WAL buffer exceeds `max_wal_bytes_size` (soft limit)
+2. **Time Limit**: `max_flush_interval` elapsed since last flush (if configured)
+3. **Explicit Flush**: `db.flush()` or `flush_with_options()` called
+4. **Shutdown**: Database close triggers final flush
+
+**Configuration**:
+
+```rust
+use slatedb::config::DbOptions;
+use std::time::Duration;
+
+let options = DbOptions {
+    max_wal_bytes_size: 4 * 1024 * 1024,  // 4MB soft limit
+    max_flush_interval: Some(Duration::from_millis(100)),  // 100ms
+    ..Default::default()
+};
+```
+
+## WAL SST Format
+
+WAL files are stored as SSTs using the same format as compacted SSTs. This reuses the existing infrastructure but has some overhead:
+
+- **Blocks**: Data is organized into blocks for parallel fetching
+- **Index**: Block index for seeking (though WAL is typically read sequentially)
+- **Filter**: Bloom filter (can be disabled with `min_filter_keys` config)
+
+**File Naming**:
+
+```
+wal/000001.sst  (WAL ID 1)
+wal/000002.sst  (WAL ID 2)
+wal/000003.sst  (WAL ID 3)
+```
+
+WAL IDs are monotonically increasing integers assigned by the writer.
+
+## WAL Replay
+
+When a database opens, the WAL is replayed to recover unflushed writes (`wal_replay.rs:90-280`).
+
+### Replay Process
+
+1. **Identify Range**: Read manifest to find `replay_after_wal_id` and latest WAL ID
+2. **Load Iterators**: Open SST iterators for each WAL file in range
+3. **Build Memtables**: Stream entries into memtables, respecting size limits
+4. **Apply to DB**: Replay memtables into database state
+
+**Implementation** (`wal_replay.rs:204-279`):
+
+```rust
+pub async fn next(&mut self) -> Result<Option<ReplayedMemtable>, SlateDBError> {
+    let table = WritableKVTable::new();
+    let mut last_wal_id = 0;
+
+    // Handle overflow from previous memtable
+    if let Some(overflow_row) = self.overflow_row.take() {
+        table.put(overflow_row.row_entry);
+        last_wal_id = overflow_row.wal_id;
+    }
+
+    // Fill memtable from WAL entries
+    while !self.current_iter.is_finished() {
+        if let Some(sst_iter) = &mut self.current_iter.current_iter {
+            let wal_id = sst_iter.table_id().unwrap_wal_id();
+            while let Some(row_entry) = sst_iter.next().await? {
+                // Skip entries already in L0
+                if row_entry.seq <= self.min_seq {
+                    continue;
+                }
+
+                // Check if memtable is full
+                if table.estimate_size() > self.options.max_memtable_bytes {
+                    self.overflow_row = Some(ReplayedRow { row_entry, wal_id });
+                    break;
+                }
+
+                table.put(row_entry);
+            }
+            last_wal_id = wal_id;
+        }
+        
+        // Load next WAL SST
+        self.advance_current_iter().await?;
+    }
+
+    Ok(Some(ReplayedMemtable {
+        table,
+        last_tick: self.last_tick,
+        last_seq: self.last_seq,
+        last_wal_id,
+    }))
+}
+```
+
+### Deduplication
+
+Replay skips entries already flushed to L0:
+
+- The manifest tracks `last_l0_seq` (highest sequence in L0)
+- Replay only processes entries with `seq > last_l0_seq`
+- This handles the case where memtable was flushed but WAL wasn't deleted yet
+
+### Recovery Guarantees
+
+- **Durability**: All writes with `await_durable: true` are recovered
+- **Ordering**: Entries are replayed in the same order they were written
+- **Idempotence**: Replay can be safely retried (already-applied entries are skipped)
+
+## WAL and Memtable Synchronization
+
+SlateDB ensures WAL durability before memtable flushes to prevent data loss:
+
+**Problem**: If memtable flushes to L0 before WAL is durable, crash recovery would miss those writes.
+
+**Solution** (from CDC RFC): Block memtable flush until WAL is confirmed durable.
+
+```rust
+// In mem_table_flush.rs
+if self.db_inner.oracle.last_remote_persisted_seq < memtable.last_seq {
+    // Wait for WAL to be durable first
+    self.flush_wals().await?;
+}
+
+// Now safe to flush memtable to L0
+self.flush_memtable_to_l0().await?;
+```
+
+This guarantees: **Any data in the database is also in the WAL**.
+
+## Configuration
+
+### WAL Options
+
+```rust
+use slatedb::config::DbOptions;
+use std::time::Duration;
+
+let options = DbOptions {
+    // Enable/disable WAL
+    wal_enabled: true,
+    
+    // Buffer size before flush
+    max_wal_bytes_size: 4 * 1024 * 1024,  // 4MB
+    
+    // Time-based flush interval
+    max_flush_interval: Some(Duration::from_millis(100)),
+    
+    // Separate object store for WAL (optional)
+    wal_object_store_uri: Some("s3://my-bucket/wal".to_string()),
+    
+    ..Default::default()
+};
+
+let db = Db::builder("mydb", object_store)
+    .with_settings(options)
+    .build()
+    .await?;
+```
+
+### Separate WAL Object Store
+
+For lower latency, store WAL on S3 Express One Zone:
+
+```rust
+use object_store::aws::AmazonS3Builder;
+
+let wal_store = AmazonS3Builder::new()
+    .with_bucket_name("my-wal-bucket")
+    .with_region("us-east-1")
+    .build()?;
+
+let db = Db::builder("mydb", main_object_store)
+    .with_wal_object_store(Arc::new(wal_store))
+    .build()
+    .await?;
+```
+
+**Benefits**:
+- Lower first-byte latency (~10ms vs ~100ms for standard S3)
+- Reduced cost if WAL is aggressively garbage collected
+- Isolation from main data path
+
+## WAL Reader (CDC)
+
+The `WalReader` API allows reading WAL files for change data capture (`wal_reader.rs:186-226`):
+
+```rust
+use slatedb::WalReader;
+
+let wal_reader = WalReader::new("/mydb", wal_object_store);
+
+// List all WAL files
+let wal_files = wal_reader.list(..).await?;
+
+for wal_file in wal_files {
+    println!("WAL ID: {}", wal_file.id);
+    
+    // Read metadata
+    let metadata = wal_file.metadata().await?;
+    println!("  Size: {} bytes", metadata.size_bytes);
+    println!("  Modified: {}", metadata.last_modified_dt);
+    
+    // Iterate entries
+    let mut iter = wal_file.iterator().await?;
+    while let Some(entry) = iter.next().await? {
+        // Process entry (send to message queue, replicate, etc.)
+        println!("  Key: {:?}, Seq: {}", entry.key, entry.seq);
+    }
+}
+```
+
+**Polling for new WAL files**:
+
+```rust
+let mut next_id = 1;
+loop {
+    let wal_file = wal_reader.get(next_id);
+    
+    if let Some(mut iter) = wal_file.iterator().await? {
+        while let Some(entry) = iter.next().await? {
+            process(entry);
+        }
+        next_id = wal_file.next_id();
+    } else {
+        // WAL file not available yet, sleep and retry
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+```
+
+See [Change Data Capture](/advanced/change-data-capture) for complete CDC documentation.
+
+## Performance Considerations
+
+### Write Latency
+
+WAL flush latency depends on:
+
+- **Object store**: S3 standard ~100ms, S3 Express ~10ms first-byte latency
+- **Batch size**: Larger batches amortize overhead but increase latency
+- **Network**: Bandwidth and distance to object store region
+
+**Tuning**:
+```rust
+// Low latency (more frequent flushes)
+max_flush_interval: Some(Duration::from_millis(10)),
+max_wal_bytes_size: 256 * 1024,  // 256KB
+
+// High throughput (larger batches)
+max_flush_interval: Some(Duration::from_millis(100)),  
+max_wal_bytes_size: 8 * 1024 * 1024,  // 8MB
+```
+
+### Recovery Time
+
+Replay time depends on:
+
+- **Number of WAL files**: More files = more object store GETs
+- **Total WAL size**: Larger WAL = more data to process
+- **Memtable size**: Smaller memtables = more L0 SSTs created during replay
+
+**Optimization**: Configure aggressive WAL garbage collection to minimize replay time.
+
+### Memory Usage
+
+WAL buffer memory is tracked in `db.estimated_bytes()`:
+
+```rust
+let bytes = db.estimated_bytes()?;
+println!("WAL buffer: {} bytes", bytes);
+```
+
+Backpressure applies when total memory (memtable + immutable memtables + WAL buffer) exceeds configured limits.
+
+## Monitoring
+
+### Metrics
+
+```rust
+pub const WAL_BUFFER_FLUSHES: &str = "wal.buffer_flushes";
+pub const WAL_BUFFER_ESTIMATED_BYTES: &str = "wal.buffer_estimated_bytes";
+```
+
+### Debugging
+
+Enable debug logging to trace WAL operations:
+
+```rust
+env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug")).init();
+```
+
+Logs include:
+- Flush triggers and sizes
+- Replay progress
+- WAL buffer state
+
+## Advanced Topics
+
+### Disabling WAL
+
+For workloads that can tolerate data loss (e.g., caches):
+
+```rust
+let options = DbOptions {
+    wal_enabled: false,
+    ..Default::default()  
+};
+```
+
+**Trade-offs**:
+- **Pros**: Lower write latency, no WAL flush overhead
+- **Cons**: Unflushed memtable data is lost on crash
+- **Note**: CDC is not supported when `wal_enabled: false`
+
+### WAL Compaction to L0
+
+The writer compacts WAL directly to L0 from memory:
+
+1. Memtable accumulates writes from WAL buffer
+2. When memtable reaches `l0_sst_size_bytes`, freeze it
+3. Write frozen memtable as L0 SST
+4. Update manifest with new L0 SST and `replay_after_wal_id`
+
+This saves network bandwidth by not reading back WAL files from object storage.
+
+### Fencing
+
+WAL writes are fenced using the manifest `writer_epoch`:
+
+1. Writer increments `writer_epoch` on startup
+2. WAL flushes include the epoch in metadata
+3. Stale writers detect epoch mismatch and abort
+
+This prevents split-brain scenarios with multiple writers.
+
+## Related Documentation
+
+- [Change Data Capture](/advanced/change-data-capture) - Reading WAL for CDC
+- [Compaction](/advanced/compaction) - WAL to L0 compaction
+- [Garbage Collection](/advanced/garbage-collection) - WAL cleanup

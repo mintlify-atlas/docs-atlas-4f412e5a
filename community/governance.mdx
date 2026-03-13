@@ -1,0 +1,143 @@
+---
+title: 'Governance'
+description: 'How SlateDB is governed and decisions are made'
+---
+
+This document defines the governance structure and decision-making process for the SlateDB open-source project.
+
+<Info>
+  This governance document does not apply to [slatedb-go](https://github.com/slatedb/slatedb-go).
+</Info>
+
+## Decision-Making Philosophy
+
+While a formal assignment of authority is necessary as a fallback mechanism, it is not the way decisions regarding SlateDB are usually made, or expected to be made.
+
+<Note>
+  The community sees disagreement as good—a diversity of perspectives having influence leads to better decisions. We seek to resolve disagreement by reaching consensus based on the merit of technical arguments, with no regard to status or formal role. This almost always works.
+</Note>
+
+## Roles
+
+There are two formal roles in the SlateDB project:
+
+<CardGroup cols={2}>
+  <Card title="SlateDB Committers" icon="code-commit">
+    Have the right to merge pull requests, publish releases, and approve RFCs
+  </Card>
+  
+  <Card title="The SlateDB Board" icon="users">
+    Has final authority over all decisions made on the project
+  </Card>
+</CardGroup>
+
+## SlateDB Committers
+
+A **SlateDB Committer** is able to merge pull requests into SlateDB repositories under [https://github.com/slatedb](https://github.com/slatedb), including into the main branches that are released to production.
+
+### Committer Responsibilities
+
+Committers are able to:
+- Merge pull requests into SlateDB repositories
+- Publish SlateDB releases
+- Approve requests for comments (RFCs)
+
+### Approval Requirements
+
+Approval requirements depend on the nature of the change:
+
+<AccordionGroup>
+  <Accordion title="RFCs and Release Proposals" icon="file-check">
+    Must be approved by **two committers** other than the author of the request.
+  </Accordion>
+  
+  <Accordion title="Small, Low-Risk PRs" icon="check">
+    Committers may merge small, low-risk, uncontroversial PRs **without any approval**.
+  </Accordion>
+  
+  <Accordion title="All Other PRs" icon="code-pull-request">
+    Must be approved by **a SlateDB committer** other than the author of the request.
+  </Accordion>
+</AccordionGroup>
+
+<Tip>
+  Approval is indicated by clicking "approve" on a PR, by making a comment indicating approval, or by simply merging a PR.
+</Tip>
+
+### Becoming a Committer
+
+To become a SlateDB committer:
+
+<Steps>
+  <Step title="Start Contributing">
+    Start making pull requests that are approved by existing committers.
+  </Step>
+  
+  <Step title="Build Trust">
+    When sufficient trust is built through working on SlateDB, any current SlateDB committer can nominate you to the board for the committer role.
+  </Step>
+</Steps>
+
+### Current Committers
+
+SlateDB's committers are listed in [slatedb-pulumi](https://github.com/slatedb/slatedb-pulumi/blob/main/__main__.py).
+
+## The SlateDB Board
+
+The **SlateDB Board** has final authority over all decisions regarding the SlateDB project.
+
+### Board Authority
+
+The board has final authority over:
+- Whether to merge (or keep) a PR in the event of any dispute
+- Who should be committers and who should be members of the board
+- Whether to make any changes to the governance policy (this document)
+
+### Board Members
+
+<CardGroup cols={2}>
+  <Card title="Vignesh Chandramohan" icon="user">
+    GitHub: [@vigneshc](https://github.com/vigneshc)
+  </Card>
+  
+  <Card title="Rohan Desai" icon="user">
+    GitHub: [@rodesai](https://github.com/rodesai)
+  </Card>
+  
+  <Card title="Chris Riccomini" icon="star">
+    **Board Leader** · GitHub: [@criccomini](https://github.com/criccomini)
+  </Card>
+  
+  <Card title="Li Yazhou" icon="user">
+    GitHub: [@flaneur2020](https://github.com/flaneur2020)
+  </Card>
+</CardGroup>
+
+### Voting Process
+
+Board votes must be conducted on a GitHub issue, GitHub pull request, or Discord post.
+
+<Steps>
+  <Step title="Cast Votes">
+    Votes are represented as **-1** (no) and **+1** (yes).
+  </Step>
+  
+  <Step title="Voting Period">
+    Voting must be open for **at least 1 week** or until all members have voted, whichever comes first.
+  </Step>
+  
+  <Step title="Determine Outcome">
+    A vote passes if a **majority of the votes placed** are in favor. On a tie, the leader of the board has a **double vote**.
+  </Step>
+</Steps>
+
+## Participation
+
+Anyone is welcome to contribute to SlateDB by:
+- [Creating pull requests](/community/contributing)
+- Taking part in discussions about features in [GitHub issues](https://github.com/slatedb/slatedb/issues)
+- Joining conversations on [Discord](https://discord.gg/mHYmGy5MgA)
+
+<Note>
+  The formal governance structure exists as a fallback mechanism. Most decisions are made through consensus and technical merit.
+</Note>

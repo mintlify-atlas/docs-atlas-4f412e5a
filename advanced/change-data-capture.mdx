@@ -1,0 +1,591 @@
+---
+title: Change Data Capture (CDC)
+description: Stream database changes in real-time using SlateDB's WAL reader
+---
+
+Change Data Capture (CDC) allows you to stream writes from SlateDB in real-time by reading the write-ahead log (WAL). This enables use cases like replication, event-driven architectures, and maintaining materialized views.
+
+## Overview
+
+SlateDB's CDC is built on the `WalReader` API, which provides:
+
+- **Ordered stream**: Entries in write order (same order as they entered the database)
+- **Low latency**: Single-digit second latency for new writes
+- **All mutations**: Exposes puts, deletes, and merge operations
+- **File-based polling**: Treat WAL files as logical boundaries to control polling
+
+```
+┌────────────────────────────────────────┐
+│  SlateDB Writer                        │
+│  ┌──────┐  ┌──────┐  ┌──────┐          │
+│  │ WAL1 │→ │ WAL2 │→ │ WAL3 │ ...      │
+│  └──────┘  └──────┘  └──────┘          │
+└────────┬───────────────────────────────┘
+         │
+         ▼
+┌────────────────────────────────────────┐
+│  Object Storage (WAL files)            │
+│  wal/001.sst, wal/002.sst, ...         │
+└────────┬───────────────────────────────┘
+         │
+         ▼
+┌────────────────────────────────────────┐
+│  WalReader (CDC Consumer)              │
+│  - Poll for new WAL files              │
+│  - Read entries sequentially           │  
+│  - Track position (WAL ID)             │
+└────────────────────────────────────────┘
+```
+
+## WalReader API
+
+The CDC API consists of three main types:
+
+### WalReader
+
+Creates handles to WAL files:
+
+```rust
+use slatedb::WalReader;
+use std::sync::Arc;
+
+let wal_reader = WalReader::new("/mydb", wal_object_store);
+```
+
+**Methods**:
+- `list(range)`: List WAL files in a range (expensive for large retention)
+- `get(id)`: Get a handle to a specific WAL file by ID
+
+### WalFile  
+
+Represents a single WAL file:
+
+```rust
+let wal_file = wal_reader.get(42);
+println!("WAL ID: {}", wal_file.id);
+
+let metadata = wal_file.metadata().await?;
+println!("Size: {} bytes", metadata.size_bytes);
+println!("Modified: {}", metadata.last_modified_dt);
+```
+
+**Methods**:
+- `metadata()`: Returns size, last modified time, and object store path
+- `iterator()`: Returns an iterator over entries in the file  
+- `next_id()`: Returns the next WAL ID after this one
+- `next_file()`: Returns a `WalFile` handle for the next ID
+
+### WalFileIterator
+
+Iterates entries in a WAL file:
+
+```rust
+let mut iter = wal_file.iterator().await?;
+while let Some(entry) = iter.next().await? {
+    println!("Key: {:?}", entry.key);
+    println!("Seq: {}", entry.seq);
+    match &entry.value {
+        ValueDeletable::Value(v) => println!("Value: {:?}", v),
+        ValueDeletable::Tombstone => println!("Deleted"),
+        ValueDeletable::Merge(m) => println!("Merge: {:?}", m),
+    }
+}
+```
+
+## Basic Usage
+
+### Streaming All Changes
+
+```rust
+use slatedb::{Db, WalReader};
+use object_store::memory::InMemory;
+use std::sync::Arc;
+
+// Open database  
+let object_store = Arc::new(InMemory::new());
+let db = Db::open("/mydb", object_store.clone()).await?;
+
+// Write some data
+db.put(b"key1", b"value1").await?;
+db.put(b"key2", b"value2").await?;
+db.flush_wal().await?;  // Ensure WAL is written
+
+// Create WAL reader
+let wal_reader = WalReader::new("/mydb", object_store.clone());
+
+// List and read all WAL files
+for wal_file in wal_reader.list(..).await? {
+    let mut iter = wal_file.iterator().await?;
+    while let Some(entry) = iter.next().await? {
+        println!("Change: {:?} -> {:?}", entry.key, entry.value);
+    }
+}
+```
+
+### Polling for New Changes
+
+For continuous streaming, poll for new WAL files without repeated listing:
+
+```rust
+use tokio::time::{sleep, Duration};
+
+// Start from WAL ID 1
+let mut next_id = 1;
+
+loop {
+    let wal_file = wal_reader.get(next_id);
+    
+    // Try to read this WAL file
+    match wal_file.iterator().await {
+        Ok(Some(mut iter)) => {
+            // Process all entries in this WAL file
+            while let Some(entry) = iter.next().await? {
+                send_to_downstream(entry).await?;
+            }
+            
+            // Move to next WAL file
+            next_id = wal_file.next_id();
+        }
+        Ok(None) => {
+            // WAL file doesn't exist yet, wait and retry
+            sleep(Duration::from_secs(1)).await;
+        }
+        Err(e) => {
+            // Handle error (file deleted by GC, network issue, etc.)
+            eprintln!("Error reading WAL {}: {}", next_id, e);
+            sleep(Duration::from_secs(5)).await;
+        }
+    }
+}
+```
+
+**Key Points**:
+- Use `get(id)` instead of `list()` to avoid expensive object store listings
+- WAL files may be garbage collected - handle missing files gracefully
+- Track your position (last successfully processed WAL ID) for recovery
+
+## Processing Semantics
+
+### Entry Types
+
+All entry types are exposed in the CDC stream:
+
+```rust
+use slatedb::types::{RowEntry, ValueDeletable};
+
+match &entry.value {
+    ValueDeletable::Value(bytes) => {
+        // Regular put operation
+        println!("PUT: {:?} = {:?}", entry.key, bytes);
+    }
+    ValueDeletable::Tombstone => {
+        // Delete operation
+        println!("DELETE: {:?}", entry.key);
+    }
+    ValueDeletable::Merge(bytes) => {
+        // Merge operation (if merge operator is configured)
+        println!("MERGE: {:?} += {:?}", entry.key, bytes);
+    }
+}
+```
+
+### Sequence Numbers
+
+Each entry has a monotonically increasing sequence number:
+
+```rust
+let entry = iter.next().await?.unwrap();
+println!("Sequence: {}", entry.seq);
+```
+
+**Usage**:
+- **Ordering**: Entries with higher sequence numbers are newer
+- **Transactions**: All entries in a transaction have the same sequence number
+- **Deduplication**: Track highest seen sequence to avoid reprocessing
+
+### Timestamps
+
+Entries may have creation and expiration timestamps:
+
+```rust
+if let Some(create_ts) = entry.create_ts {
+    println!("Created at: {}", create_ts);
+}
+
+if let Some(expire_ts) = entry.expire_ts {
+    println!("Expires at: {}", expire_ts);
+    // Note: Expired entries are NOT automatically filtered from CDC
+}
+```
+
+**Important**: CDC exposes entries regardless of TTL. Consumers must implement their own TTL handling if needed.
+
+## Exactly-Once Processing
+
+To achieve exactly-once semantics, atomically persist your output with your CDC position:
+
+```rust
+use tokio_postgres::{Client, NoTls};
+
+// Example: Replicate to PostgreSQL
+let (client, connection) = tokio_postgres::connect(
+    "host=localhost user=postgres",
+    NoTls,
+).await?;
+
+tokio::spawn(connection);
+
+// Create tables
+client.execute(
+    "CREATE TABLE IF NOT EXISTS slatedb_replica (key BYTEA PRIMARY KEY, value BYTEA)",
+    &[],
+).await?;
+
+client.execute(
+    "CREATE TABLE IF NOT EXISTS cdc_position (id INT PRIMARY KEY, wal_id BIGINT)",
+    &[],
+).await?;
+
+// Load last position
+let last_wal_id: i64 = client
+    .query_one("SELECT wal_id FROM cdc_position WHERE id = 1", &[])
+    .await
+    .map(|row| row.get(0))
+    .unwrap_or(0);
+
+let mut next_id = (last_wal_id + 1) as u64;
+
+loop {
+    let wal_file = wal_reader.get(next_id);
+    
+    if let Some(mut iter) = wal_file.iterator().await? {
+        // Begin transaction
+        let tx = client.transaction().await?;
+        
+        // Process all entries in this WAL file
+        while let Some(entry) = iter.next().await? {
+            match &entry.value {
+                ValueDeletable::Value(v) => {
+                    tx.execute(
+                        "INSERT INTO slatedb_replica (key, value) 
+                         VALUES ($1, $2) 
+                         ON CONFLICT (key) DO UPDATE SET value = $2",
+                        &[&entry.key.as_ref(), &v.as_ref()],
+                    ).await?;
+                }
+                ValueDeletable::Tombstone => {
+                    tx.execute(
+                        "DELETE FROM slatedb_replica WHERE key = $1",
+                        &[&entry.key.as_ref()],
+                    ).await?;
+                }
+                ValueDeletable::Merge(_) => {
+                    // Handle merge operands based on your merge operator logic
+                }
+            }
+        }
+        
+        // Update position atomically with data changes
+        tx.execute(
+            "INSERT INTO cdc_position (id, wal_id) VALUES (1, $1) 
+             ON CONFLICT (id) DO UPDATE SET wal_id = $1",
+            &[&(next_id as i64)],
+        ).await?;
+        
+        // Commit transaction
+        tx.commit().await?;
+        
+        next_id = wal_file.next_id();
+    } else {
+        sleep(Duration::from_secs(1)).await;
+    }
+}
+```
+
+## Handling WAL Garbage Collection
+
+WAL files are eventually deleted by garbage collection. Handle this gracefully:
+
+```rust
+loop {
+    let wal_file = wal_reader.get(next_id);
+    
+    match wal_file.iterator().await {
+        Ok(Some(iter)) => {
+            // Process WAL file
+            process_wal_file(iter).await?;
+            next_id = wal_file.next_id();
+        }
+        Ok(None) => {
+            // File doesn't exist - either not written yet or GC'd
+            // Try to re-sync by listing
+            let wal_files = wal_reader.list(next_id..).await?;
+            
+            if let Some(first) = wal_files.first() {
+                eprintln!("Skipped WAL IDs {} to {}", next_id, first.id - 1);
+                next_id = first.id;
+            } else {
+                // No WAL files available, wait
+                sleep(Duration::from_secs(1)).await;
+            }
+        }
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            sleep(Duration::from_secs(5)).await;
+        }
+    }
+}
+```
+
+**Best Practices**:
+- Configure aggressive WAL `min_age` for faster GC
+- Track your lag (current WAL ID - your position)
+- Alert if lag exceeds acceptable threshold
+- Consider copying critical WAL files to separate storage if needed
+
+## Bootstrapping and Backfilling
+
+To bootstrap initial state before streaming changes:
+
+### Option 1: Accept Duplicates
+
+Simplest approach - scan the database, then start streaming from WAL ID 1:
+
+```rust
+// 1. Scan existing data
+let mut scan = db.scan(..);
+while let Some(kv) = scan.next().await? {
+    insert_into_downstream(kv.key, kv.value).await?;
+}
+
+// 2. Stream changes from WAL
+let wal_reader = WalReader::new("/mydb", object_store);
+let mut next_id = 1;
+// ... stream as shown above
+```
+
+**Trade-off**: Data written during scan will be duplicated (seen in scan AND WAL stream).
+
+### Option 2: Use Sequence Numbers
+
+De-duplicate using sequence numbers (requires snapshot API - see RFC #1247):
+
+```rust
+// 1. Start WAL streaming in background
+let (tx, rx) = tokio::sync::mpsc::channel(1000);
+tokio::spawn(stream_wal(wal_reader, tx));
+
+// 2. Scan with sequence number tracking  
+let mut max_scanned_seq = 0;
+let mut scan = db.scan_with_seqnum(..);  // Hypothetical API
+while let Some((kv, seq)) = scan.next().await? {
+    insert_into_downstream(kv.key, kv.value).await?;
+    max_scanned_seq = max_scanned_seq.max(seq);
+}
+
+// 3. Process WAL stream, skipping entries <= max_scanned_seq
+while let Some(entry) = rx.recv().await {
+    if entry.seq > max_scanned_seq {
+        insert_into_downstream(entry.key, entry.value).await?;
+    }
+}
+```
+
+**Trade-off**: Requires enhanced scan API to expose sequence numbers.
+
+### Option 3: Checkpoint-Based
+
+Use checkpoints for consistent point-in-time snapshot (future work):
+
+```rust
+// 1. Create checkpoint
+let checkpoint = db.create_checkpoint().await?;
+let checkpoint_manifest_id = checkpoint.manifest_id;
+
+// 2. Scan from checkpoint
+let snapshot = db.open_checkpoint(checkpoint).await?;
+let mut scan = snapshot.scan(..);
+while let Some(kv) = scan.next().await? {
+    insert_into_downstream(kv.key, kv.value).await?;
+}
+
+// 3. Stream from WAL after checkpoint's last WAL ID
+let manifest = read_manifest(checkpoint_manifest_id)?;
+let start_wal_id = manifest.replay_after_wal_id + 1;
+
+let mut next_id = start_wal_id;
+// ... stream as shown above
+```
+
+**Trade-off**: Requires checkpoint API enhancements to expose starting WAL position.
+
+## Advanced Patterns
+
+### Parallel Processing
+
+Process multiple WAL files concurrently:
+
+```rust
+use tokio::task::JoinSet;
+
+let mut tasks = JoinSet::new();
+let max_concurrent = 4;
+
+let wal_files = wal_reader.list(..).await?;
+for wal_file in wal_files {
+    if tasks.len() >= max_concurrent {
+        // Wait for a task to complete
+        tasks.join_next().await;
+    }
+    
+    // Process this WAL file in parallel
+    let wal_file = wal_file.clone();
+    tasks.spawn(async move {
+        let mut iter = wal_file.iterator().await?;
+        while let Some(entry) = iter.next().await? {
+            process(entry).await?;
+        }
+        Ok::<_, Error>(wal_file.id)
+    });
+}
+
+// Wait for remaining tasks
+while let Some(result) = tasks.join_next().await {
+    let wal_id = result??;
+    println!("Completed WAL {}", wal_id);
+}
+```
+
+**Caution**: Parallel processing breaks ordering guarantees. Only use if your downstream can handle out-of-order writes.
+
+### Filtering by Key Prefix
+
+```rust
+let prefix = b"user:";
+
+let mut iter = wal_file.iterator().await?;
+while let Some(entry) = iter.next().await? {
+    if entry.key.starts_with(prefix) {
+        send_to_downstream(entry).await?;
+    }
+}
+```
+
+### Aggregating Changes
+
+Coalesce multiple updates to the same key:
+
+```rust
+use std::collections::HashMap;
+
+let mut batch: HashMap<Bytes, RowEntry> = HashMap::new();
+
+let mut iter = wal_file.iterator().await?;
+while let Some(entry) = iter.next().await? {
+    // Keep only the latest entry for each key
+    batch.insert(entry.key.clone(), entry);
+}
+
+// Send aggregated batch
+for (key, entry) in batch {
+    send_to_downstream(entry).await?;
+}
+```
+
+## Configuration and Tuning
+
+### WAL Retention
+
+Configure how long WAL files are kept:
+
+```rust
+use slatedb::config::GarbageCollectorDirectoryOptions;
+use std::time::Duration;
+
+let gc_options = GarbageCollectorOptions {
+    wal_options: Some(GarbageCollectorDirectoryOptions {
+        min_age: Duration::from_secs(3600),  // Keep for 1 hour
+        interval: Some(Duration::from_secs(300)),  // GC every 5 min
+    }),
+    ..Default::default()
+};
+
+let db = Db::builder("/mydb", object_store)
+    .with_gc_options(gc_options)
+    .build()
+    .await?;
+```
+
+**Tuning**:
+- Higher `min_age` = more WAL retention, slower consumers can catch up
+- Lower `min_age` = less storage cost, faster GC, consumers must stay caught up
+
+### Polling Interval
+
+Balance latency vs object store cost:
+
+```rust
+// Low latency (more frequent polls, higher cost)
+loop {
+    poll_next_wal().await?;
+    sleep(Duration::from_millis(100)).await;  // 100ms
+}
+
+// Cost optimized (less frequent polls, higher latency)  
+loop {
+    poll_next_wal().await?;
+    sleep(Duration::from_secs(5)).await;  // 5 seconds
+}
+```
+
+## Limitations
+
+### Not Supported
+
+The current CDC implementation does **not** provide:
+
+- **Transaction boundaries**: Individual WAL files may span multiple transactions
+- **Automatic TTL filtering**: Expired entries are included; consumers must filter
+- **Merge operator resolution**: Merge operands are exposed as-is
+- **Consumer offset management**: No built-in offset tracking or consumer groups
+- **Guaranteed retention**: WAL files may be GC'd; no pinning mechanism
+
+### Workarounds
+
+**Transaction boundaries**: Use sequence numbers to group entries:
+
+```rust
+let mut current_seq = 0;
+let mut txn_entries = Vec::new();
+
+while let Some(entry) = iter.next().await? {
+    if entry.seq != current_seq {
+        if !txn_entries.is_empty() {
+            // Process complete transaction
+            process_transaction(txn_entries).await?;
+            txn_entries.clear();
+        }
+        current_seq = entry.seq;
+    }
+    txn_entries.push(entry);
+}
+```
+
+**TTL filtering**: Implement in consumer:
+
+```rust
+while let Some(entry) = iter.next().await? {
+    if let Some(expire_ts) = entry.expire_ts {
+        if expire_ts < now_ms() {
+            continue;  // Skip expired entry
+        }
+    }
+    process(entry).await?;
+}
+```
+
+## Related Documentation
+
+- [Write-Ahead Log](/advanced/wal) - WAL architecture and configuration
+- [Garbage Collection](/advanced/garbage-collection) - WAL retention and cleanup
+- [Compaction](/advanced/compaction) - How WAL is compacted to L0

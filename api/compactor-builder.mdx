@@ -1,0 +1,252 @@
+---
+title: CompactorBuilder
+description: API reference for CompactorBuilder, used to construct a standalone compactor process
+---
+
+## Overview
+
+The `CompactorBuilder` is used to construct and configure a standalone compactor process that runs background compactions for a SlateDB database. The compactor is responsible for merging L0 SSTables and sorted runs to reduce space and read amplification.
+
+<Note>
+Compactors are typically run as separate processes from the main database instance. Only one compactor should run per database to avoid conflicts.
+</Note>
+
+## Constructor
+
+Create a new `CompactorBuilder` through the database builder:
+
+```rust
+use slatedb::db::builder::CompactorBuilder;
+
+let compactor_builder = CompactorBuilder::new(
+    path,
+    object_store,
+    compactor_options,
+);
+```
+
+<ParamField path="path" type="impl Into<Path>" required>
+  The path to the database in object storage.
+</ParamField>
+
+<ParamField path="object_store" type="Arc<dyn ObjectStore>" required>
+  The object store where database files are stored.
+</ParamField>
+
+<ParamField path="compactor_options" type="CompactorOptions" required>
+  Configuration options for the compactor.
+</ParamField>
+
+## Configuration Methods
+
+### with_scheduler_supplier()
+
+Sets a custom compaction scheduler supplier.
+
+```rust
+pub fn with_scheduler_supplier(
+    self,
+    scheduler_supplier: Arc<dyn CompactionSchedulerSupplier>,
+) -> Self
+```
+
+<ParamField path="scheduler_supplier" type="Arc<dyn CompactionSchedulerSupplier>" required>
+  A custom scheduler that decides which sorted runs to compact together.
+</ParamField>
+
+By default, SlateDB uses a size-tiered compaction scheduler. Custom schedulers can implement different compaction strategies (e.g., leveled compaction).
+
+#### Example
+
+```rust
+use slatedb::size_tiered_compaction::SizeTieredCompactionSchedulerSupplier;
+
+let compactor_builder = compactor_builder
+    .with_scheduler_supplier(Arc::new(SizeTieredCompactionSchedulerSupplier::new()));
+```
+
+### with_runtime()
+
+Sets the Tokio runtime handle for executing compaction tasks.
+
+```rust
+pub fn with_runtime(self, runtime: Handle) -> Self
+```
+
+<ParamField path="runtime" type="Handle" required>
+  The Tokio runtime handle for running compaction work.
+</ParamField>
+
+By default, the compactor creates its own runtime. This method allows using a custom runtime.
+
+### with_merge_operator()
+
+Sets the merge operator for the compactor.
+
+```rust
+pub fn with_merge_operator(self, merge_operator: MergeOperatorType) -> Self
+```
+
+<ParamField path="merge_operator" type="MergeOperatorType" required>
+  The merge operator implementation for combining merge operands during compaction.
+</ParamField>
+
+<Note>
+The merge operator set on the compactor must be the same as the one used by the database instance to ensure consistent behavior.
+</Note>
+
+#### Example
+
+```rust
+use std::sync::Arc;
+use slatedb::MergeOperator;
+
+struct CounterMergeOperator;
+
+impl MergeOperator for CounterMergeOperator {
+    fn merge(&self, _key: &Bytes, existing: Option<Bytes>, operand: Bytes) 
+        -> Result<Bytes, MergeOperatorError> {
+        // Implementation
+    }
+}
+
+let compactor_builder = compactor_builder
+    .with_merge_operator(Arc::new(CounterMergeOperator));
+```
+
+## Build and Run
+
+### build()
+
+Builds the compactor instance.
+
+```rust
+pub async fn build(self) -> Result<Compactor, Error>
+```
+
+#### Returns
+
+A configured `Compactor` instance ready to run.
+
+#### Errors
+
+Returns an error if:
+- The manifest cannot be loaded
+- The object store is inaccessible
+- The configuration is invalid
+
+### Running the Compactor
+
+After building, run the compactor:
+
+```rust
+let compactor = compactor_builder.build().await?;
+compactor.run().await?;
+```
+
+The `run()` method blocks until the compactor is stopped (via the cancellation token or shutdown signal).
+
+## Complete Example
+
+```rust
+use std::sync::Arc;
+use object_store::memory::InMemory;
+use slatedb::config::CompactorOptions;
+use slatedb::db::builder::CompactorBuilder;
+use std::time::Duration;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let object_store = Arc::new(InMemory::new());
+    let path = "/my/db";
+    
+    let compactor_options = CompactorOptions {
+        poll_interval: Duration::from_secs(5),
+        manifest_update_timeout: Duration::from_secs(300),
+        max_sst_size: 256 * 1024 * 1024,
+        max_concurrent_compactions: 4,
+        scheduler_options: Default::default(),
+    };
+    
+    let compactor = CompactorBuilder::new(
+        path,
+        object_store,
+        compactor_options,
+    )
+    .build()
+    .await?;
+    
+    // Run the compactor (blocks until shutdown)
+    compactor.run().await?;
+    
+    Ok(())
+}
+```
+
+## Compactor Architecture
+
+The compactor consists of several components:
+
+### CompactionScheduler
+
+Decides which sorted runs should be compacted together based on the current database state. The default implementation uses size-tiered compaction.
+
+### CompactionExecutor
+
+Executes the actual compaction work by:
+1. Reading input SSTables/sorted runs
+2. Merging entries using a merge iterator
+3. Applying retention and merge operators
+4. Writing output SSTables to a new sorted run
+
+### Event Loop
+
+The main compactor event loop:
+1. Polls the manifest for new state
+2. Asks the scheduler for compaction candidates
+3. Starts compaction jobs on the executor
+4. Updates the manifest when compactions complete
+
+## Compaction Metrics
+
+The compactor exposes metrics for monitoring:
+
+<ResponseField name="compactor.last_compaction_timestamp_sec" type="Gauge<u64>">
+  Unix timestamp of the last completed compaction.
+</ResponseField>
+
+<ResponseField name="compactor.running_compactions" type="Gauge<i64>">
+  Number of currently running compaction tasks.
+</ResponseField>
+
+<ResponseField name="compactor.bytes_compacted" type="Counter">
+  Total bytes written by compaction jobs.
+</ResponseField>
+
+<ResponseField name="compactor.total_bytes_being_compacted" type="Gauge<u64>">
+  Total estimated bytes across all active compactions.
+</ResponseField>
+
+<ResponseField name="compactor.total_throughput_bytes_per_sec" type="Gauge<u64>">
+  Combined throughput across all running compactions in bytes per second.
+</ResponseField>
+
+## Best Practices
+
+### Resource Allocation
+
+- Run the compactor on a machine with sufficient CPU and memory
+- Set `max_concurrent_compactions` based on available CPU cores
+- Monitor compaction throughput and adjust resources as needed
+
+### High Availability
+
+- Run only one compactor instance per database
+- Use health checks and automatic restart on failure
+- Monitor compaction lag to detect issues
+
+### Tuning
+
+- Increase `max_sst_size` for larger databases to reduce SST count
+- Adjust `poll_interval` based on write rate and compaction needs
+- Configure scheduler options for your workload pattern

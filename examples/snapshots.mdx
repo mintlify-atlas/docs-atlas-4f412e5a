@@ -1,0 +1,410 @@
+---
+title: Snapshots & Checkpoints
+description: Use snapshots for point-in-time reads and checkpoints for backup and recovery
+---
+
+SlateDB provides two mechanisms for consistent point-in-time access: snapshots for read-only views and checkpoints for backup and recovery.
+
+## Snapshots
+
+Snapshots provide a consistent, read-only view of the database at a specific point in time. Changes made after the snapshot is created are not visible through the snapshot.
+
+### Creating and Using Snapshots
+
+```rust
+use slatedb::config::Settings;
+use slatedb::{Db, Error};
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    // Initialize database
+    let object_store = Arc::new(slatedb::object_store::memory::InMemory::new());
+    let db = Db::builder("my_db", object_store)
+        .with_settings(Settings::default())
+        .build()
+        .await?;
+
+    // Write some data to the database
+    db.put(b"key1", b"original_value").await?;
+    db.put(b"key2", b"data_before_snapshot").await?;
+
+    // Create a snapshot
+    let snapshot = db.snapshot().await?;
+    println!("Snapshot created successfully");
+
+    // After creating snapshot, make changes to the database
+    db.put(b"key1", b"modified_value").await?;
+
+    // Read from snapshot - should see original data
+    let snapshot_value1 = snapshot.get(b"key1").await?;
+    println!(
+        "Snapshot key1: {:?}",
+        snapshot_value1.map(|v| String::from_utf8_lossy(&v).to_string())
+    );
+
+    // Read from database - should see updated data
+    let db_value1 = db.get(b"key1").await?;
+    println!(
+        "Database key1: {:?}",
+        db_value1.map(|v| String::from_utf8_lossy(&v).to_string())
+    );
+
+    Ok(())
+}
+```
+
+Output:
+```
+Snapshot created successfully
+Snapshot key1: Some("original_value")
+Database key1: Some("modified_value")
+```
+
+### Scanning Snapshots
+
+You can iterate over ranges in a snapshot just like the main database:
+
+```rust
+use slatedb::config::Settings;
+use slatedb::{Db, Error};
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    // Initialize database
+    let object_store = Arc::new(slatedb::object_store::memory::InMemory::new());
+    let db = Db::builder("my_db", object_store)
+        .with_settings(Settings::default())
+        .build()
+        .await?;
+
+    // Write some data to the database
+    db.put(b"apple", b"red").await?;
+    db.put(b"banana", b"yellow").await?;
+    db.put(b"cherry", b"red").await?;
+
+    // Create a snapshot
+    let snapshot = db.snapshot().await?;
+    println!("Snapshot created successfully");
+
+    // After creating snapshot, make changes to the database
+    db.put(b"apple", b"green").await?;  // Modify existing
+    db.put(b"date", b"brown").await?;   // Add new key
+    db.delete(b"banana").await?;         // Delete existing
+
+    // Scan from snapshot - should see original data
+    println!("\nScanning snapshot:");
+    let mut snapshot_iter = snapshot.scan(b"a".to_vec()..=b"z".to_vec()).await?;
+    while let Some(kv) = snapshot_iter.next().await? {
+        println!(
+            "  {}: {}",
+            String::from_utf8_lossy(&kv.key),
+            String::from_utf8_lossy(&kv.value)
+        );
+    }
+
+    // Scan from database - should see updated data
+    println!("\nScanning database:");
+    let mut db_iter = db.scan(b"a".to_vec()..=b"z".to_vec()).await?;
+    while let Some(kv) = db_iter.next().await? {
+        println!(
+            "  {}: {}",
+            String::from_utf8_lossy(&kv.key),
+            String::from_utf8_lossy(&kv.value)
+        );
+    }
+
+    Ok(())
+}
+```
+
+Output:
+```
+Snapshot created successfully
+
+Scanning snapshot:
+  apple: red
+  banana: yellow
+  cherry: red
+
+Scanning database:
+  apple: green
+  cherry: red
+  date: brown
+```
+
+## Use Cases for Snapshots
+
+<CardGroup cols={2}>
+  <Card title="Consistent Reads" icon="book-open">
+    Read a consistent view of data while writes continue in the background.
+  </Card>
+  
+  <Card title="Analytics" icon="chart-line">
+    Run long-running analytical queries without blocking writes.
+  </Card>
+  
+  <Card title="Reporting" icon="file-chart-column">
+    Generate reports from a point-in-time snapshot.
+  </Card>
+  
+  <Card title="Testing" icon="flask">
+    Test queries against a stable dataset while the database evolves.
+  </Card>
+</CardGroup>
+
+## Checkpoints
+
+Checkpoints are snapshots persisted to object storage that can be used for backup, recovery, and time-travel queries. Unlike in-memory snapshots, checkpoints persist beyond the lifetime of the database process.
+
+### Creating Checkpoints
+
+```rust
+use slatedb::admin::AdminBuilder;
+use slatedb::config::CheckpointOptions;
+use slatedb::object_store::memory::InMemory;
+use slatedb::Db;
+use std::{sync::Arc, time::Duration};
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let path = "/tmp/slatedb-checkpoint";
+    let object_store = Arc::new(InMemory::new());
+    let db = Db::open(path, object_store.clone()).await?;
+
+    // Write some data
+    db.put(b"important_key", b"important_value").await?;
+    
+    db.close().await?;
+
+    // Create a checkpoint using the admin API
+    let admin = AdminBuilder::new(path, object_store).build();
+
+    let result = admin
+        .create_detached_checkpoint(&CheckpointOptions {
+            lifetime: Some(Duration::from_secs(3600)), // expires in 1 hour
+            ..Default::default()
+        })
+        .await?;
+
+    println!(
+        "Created checkpoint: ID = {}, Manifest = {}",
+        result.id, result.manifest_id
+    );
+
+    Ok(())
+}
+```
+
+### Refreshing Checkpoints
+
+Extend the lifetime of a checkpoint:
+
+```rust
+use slatedb::admin::AdminBuilder;
+use slatedb::config::CheckpointOptions;
+use slatedb::object_store::memory::InMemory;
+use slatedb::Db;
+use std::{sync::Arc, time::Duration};
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let path = "/tmp/slatedb-checkpoint";
+    let object_store = Arc::new(InMemory::new());
+    let db = Db::open(path, object_store.clone()).await?;
+
+    db.close().await?;
+
+    let admin = AdminBuilder::new(path, object_store).build();
+
+    // Create a checkpoint with 1 hour lifetime
+    let result = admin
+        .create_detached_checkpoint(&CheckpointOptions {
+            lifetime: Some(Duration::from_secs(3600)),
+            ..Default::default()
+        })
+        .await?;
+
+    // Refresh the checkpoint with extended 2-hour lifetime
+    admin
+        .refresh_checkpoint(result.id, Some(Duration::from_secs(7200)))
+        .await?;
+
+    println!(
+        "Checkpoint refreshed with extended 2-hour lifetime. ID: {}",
+        result.id
+    );
+
+    Ok(())
+}
+```
+
+### Deleting Checkpoints
+
+Clean up checkpoints when they're no longer needed:
+
+```rust
+use slatedb::admin::AdminBuilder;
+use slatedb::config::CheckpointOptions;
+use slatedb::object_store::memory::InMemory;
+use slatedb::Db;
+use std::{sync::Arc, time::Duration};
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let path = "/tmp/slatedb-checkpoint";
+    let object_store = Arc::new(InMemory::new());
+    let db = Db::open(path, object_store.clone()).await?;
+
+    db.close().await?;
+
+    let admin = AdminBuilder::new(path, object_store).build();
+
+    let result = admin
+        .create_detached_checkpoint(&CheckpointOptions {
+            lifetime: Some(Duration::from_secs(3600)),
+            ..Default::default()
+        })
+        .await?;
+
+    // Delete the checkpoint
+    admin.delete_checkpoint(result.id).await?;
+
+    println!("Deleted checkpoint: ID = {}", result.id);
+
+    Ok(())
+}
+```
+
+## Checkpoint Lifecycle
+
+<Steps>
+  <Step title="Create checkpoint">
+    Use `AdminBuilder` to create a checkpoint with a specified lifetime.
+    
+    ```rust
+    let result = admin.create_detached_checkpoint(&CheckpointOptions {
+        lifetime: Some(Duration::from_secs(3600)),
+        ..Default::default()
+    }).await?;
+    ```
+  </Step>
+
+  <Step title="Use checkpoint">
+    Restore from or query the checkpoint as needed. The checkpoint persists in object storage.
+  </Step>
+
+  <Step title="Refresh (optional)">
+    Extend the lifetime if you need to keep the checkpoint longer.
+    
+    ```rust
+    admin.refresh_checkpoint(checkpoint_id, Some(Duration::from_secs(7200))).await?;
+    ```
+  </Step>
+
+  <Step title="Delete or expire">
+    Manually delete the checkpoint or let it expire after its lifetime.
+    
+    ```rust
+    admin.delete_checkpoint(checkpoint_id).await?;
+    ```
+  </Step>
+</Steps>
+
+## Comparison: Snapshots vs Checkpoints
+
+| Feature | Snapshot | Checkpoint |
+|---------|----------|------------|
+| **Lifetime** | In-memory, process-bound | Persisted to object storage |
+| **Use case** | Short-lived consistent reads | Backup, recovery, time-travel |
+| **Creation** | `db.snapshot()` | `admin.create_detached_checkpoint()` |
+| **Cost** | Minimal (memory only) | Storage costs in object store |
+| **Durability** | Lost on process restart | Survives restarts |
+| **Management** | Automatic cleanup | Manual or lifetime-based |
+
+## Production Patterns
+
+### Backup Strategy with Checkpoints
+
+```rust
+use slatedb::admin::AdminBuilder;
+use slatedb::config::CheckpointOptions;
+use std::time::Duration;
+
+// Create daily backups with 30-day retention
+async fn create_daily_backup(
+    admin: &slatedb::admin::Admin,
+) -> anyhow::Result<()> {
+    let result = admin
+        .create_detached_checkpoint(&CheckpointOptions {
+            lifetime: Some(Duration::from_secs(30 * 24 * 60 * 60)), // 30 days
+            ..Default::default()
+        })
+        .await?;
+    
+    println!("Daily backup created: {}", result.id);
+    
+    // Store checkpoint ID for recovery procedures
+    // You might store this in a database or monitoring system
+    
+    Ok(())
+}
+```
+
+### Long-Running Analytics with Snapshots
+
+```rust
+use slatedb::Db;
+
+async fn run_analytics(db: &Db) -> anyhow::Result<()> {
+    // Create snapshot for consistent view
+    let snapshot = db.snapshot().await?;
+    
+    // Run long analytics query
+    let mut iter = snapshot.scan::<Vec<u8>, _>(..).await?;
+    let mut count = 0;
+    
+    while let Some(kv) = iter.next().await? {
+        // Process each key-value pair
+        count += 1;
+    }
+    
+    println!("Processed {} records", count);
+    
+    Ok(())
+}
+```
+
+## Best Practices
+
+<AccordionGroup>
+  <Accordion title="When to use snapshots">
+    - Short-lived consistent reads within a single process
+    - Analytical queries that need consistency but not durability
+    - Testing and development scenarios
+    - When you don't need to persist the view beyond process lifetime
+  </Accordion>
+
+  <Accordion title="When to use checkpoints">
+    - Disaster recovery and backup
+    - Long-term archival
+    - Time-travel queries across restarts
+    - Compliance and auditing requirements
+    - Blue-green deployments or A/B testing
+  </Accordion>
+
+  <Accordion title="Checkpoint management">
+    - Set appropriate lifetimes based on your retention policy
+    - Monitor checkpoint storage costs
+    - Automate checkpoint creation for critical backups
+    - Clean up old checkpoints to save storage costs
+    - Document checkpoint IDs and their purposes
+  </Accordion>
+</AccordionGroup>
+
+## Next Steps
+
+- Review [configuration options](/configuration) for checkpoint settings
+- Learn about [compaction](/examples/compaction) and its interaction with snapshots
+- Explore [object store configuration](/examples/object-stores) for checkpoint storage

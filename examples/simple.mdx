@@ -1,0 +1,197 @@
+---
+title: Simple Example
+description: Get started with SlateDB in just a few lines of code
+---
+
+This guide shows you how to get started with SlateDB using an in-memory object store. This is perfect for testing, development, or learning how SlateDB works.
+
+## Basic Usage
+
+Here's the simplest possible SlateDB example:
+
+```rust
+use slatedb::object_store::memory::InMemory;
+use slatedb::{Db, Error};
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    let object_store = Arc::new(InMemory::new());
+    let db = Db::open("/tmp/slatedb_simple_example", object_store).await?;
+
+    db.put(b"key", b"value").await?;
+
+    match db.get(b"key").await? {
+        Some(value) => println!("value: {value:?}"),
+        None => println!("value not found"),
+    }
+
+    db.close().await?;
+
+    Ok(())
+}
+```
+
+<Steps>
+  <Step title="Create an object store">
+    SlateDB requires an object store backend. For development, use the in-memory store:
+    
+    ```rust
+    let object_store = Arc::new(InMemory::new());
+    ```
+  </Step>
+
+  <Step title="Open the database">
+    Open a database at the specified path:
+    
+    ```rust
+    let db = Db::open("/tmp/slatedb_simple_example", object_store).await?;
+    ```
+  </Step>
+
+  <Step title="Perform operations">
+    Put and get values using byte slices:
+    
+    ```rust
+    db.put(b"key", b"value").await?;
+    let value = db.get(b"key").await?;
+    ```
+  </Step>
+
+  <Step title="Close the database">
+    Always close the database when you're done:
+    
+    ```rust
+    db.close().await?;
+    ```
+  </Step>
+</Steps>
+
+## Full CRUD Example
+
+Here's a more complete example showing put, get, delete, and scan operations:
+
+```rust
+use slatedb::{object_store::memory::InMemory, Db, Error};
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    // Setup
+    let object_store = Arc::new(InMemory::new());
+    let kv_store = Db::open("/tmp/slatedb_full_example", object_store).await?;
+
+    // Put
+    let key = b"test_key";
+    let value = b"test_value";
+    kv_store.put(key, value).await?;
+
+    // Get
+    assert_eq!(kv_store.get(key).await?, Some("test_value".into()));
+
+    // Delete
+    kv_store.delete(key).await?;
+    assert!(kv_store.get(key).await?.is_none());
+
+    kv_store.put(b"test_key1", b"test_value1").await?;
+    kv_store.put(b"test_key2", b"test_value2").await?;
+    kv_store.put(b"test_key3", b"test_value3").await?;
+    kv_store.put(b"test_key4", b"test_value4").await?;
+
+    // Scan over unbound range
+    let mut iter = kv_store.scan::<Vec<u8>, _>(..).await?;
+    let mut count = 1;
+    while let Ok(Some(item)) = iter.next().await {
+        assert_eq!(item.key, format!("test_key{count}").into_bytes());
+        assert_eq!(item.value, format!("test_value{count}").into_bytes());
+        count += 1;
+    }
+
+    // Scan over bound range
+    let mut iter = kv_store.scan("test_key1"..="test_key2").await?;
+    let kv1 = iter.next().await?.unwrap();
+    assert_eq!(kv1.key, b"test_key1".as_slice());
+    assert_eq!(kv1.value, b"test_value1".as_slice());
+
+    let kv2 = iter.next().await?.unwrap();
+    assert_eq!(kv2.key, b"test_key2".as_slice());
+    assert_eq!(kv2.value, b"test_value2".as_slice());
+
+    // Seek ahead to next key
+    let mut iter = kv_store.scan::<Vec<u8>, _>(..).await?;
+    let next_key = b"test_key4";
+    iter.seek(next_key).await?;
+    let kv4 = iter.next().await?.unwrap();
+    assert_eq!(kv4.key, b"test_key4".as_slice());
+    assert_eq!(kv4.value, b"test_value4".as_slice());
+    assert_eq!(iter.next().await?, None);
+
+    // Close
+    kv_store.close().await?;
+
+    Ok(())
+}
+```
+
+## Key Operations
+
+### Put
+
+Write a key-value pair to the database:
+
+```rust
+db.put(b"key", b"value").await?;
+```
+
+### Get
+
+Retrieve a value by key:
+
+```rust
+let value = db.get(b"key").await?;
+match value {
+    Some(v) => println!("Found: {:?}", v),
+    None => println!("Key not found"),
+}
+```
+
+### Delete
+
+Remove a key-value pair:
+
+```rust
+db.delete(b"key").await?;
+```
+
+### Scan
+
+Iterate over a range of keys:
+
+```rust
+// Scan all keys
+let mut iter = db.scan::<Vec<u8>, _>(..).await?;
+
+// Scan a specific range
+let mut iter = db.scan("start_key"..="end_key").await?;
+
+// Process results
+while let Ok(Some(kv)) = iter.next().await {
+    println!("{:?} = {:?}", kv.key, kv.value);
+}
+```
+
+### Seek
+
+Jump to a specific position in an iterator:
+
+```rust
+let mut iter = db.scan::<Vec<u8>, _>(..).await?;
+iter.seek(b"target_key").await?;
+let kv = iter.next().await?;
+```
+
+## Next Steps
+
+- Learn how to [configure object stores](/examples/object-stores) for production use
+- Understand [compaction](/examples/compaction) for performance optimization
+- Explore [snapshots](/examples/snapshots) for point-in-time reads
