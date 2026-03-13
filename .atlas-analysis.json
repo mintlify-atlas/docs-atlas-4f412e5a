@@ -1,0 +1,183 @@
+{
+  "projectType": "sdk-library",
+  "projectName": "SlateDB",
+  "projectDescription": "A cloud native embedded storage engine built as an LSM-tree on object storage with bottomless capacity and high durability.",
+  "theme": "aspen",
+  "primaryColor": "#040404",
+  "lightColor": null,
+  "darkColor": null,
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "installation"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/architecture",
+              "concepts/lsm-tree",
+              "concepts/object-storage",
+              "concepts/durability"
+            ]
+          },
+          {
+            "group": "Configuration",
+            "pages": [
+              "configuration/settings",
+              "configuration/object-stores",
+              "configuration/compaction",
+              "configuration/caching"
+            ]
+          },
+          {
+            "group": "Operations",
+            "pages": [
+              "operations/basic-operations",
+              "operations/transactions",
+              "operations/scanning",
+              "operations/merge-operators",
+              "operations/snapshots",
+              "operations/checkpoints"
+            ]
+          },
+          {
+            "group": "Advanced",
+            "pages": [
+              "advanced/compaction",
+              "advanced/garbage-collection",
+              "advanced/wal",
+              "advanced/change-data-capture",
+              "advanced/compaction-filters"
+            ]
+          },
+          {
+            "group": "Language Bindings",
+            "pages": [
+              "bindings/rust",
+              "bindings/go",
+              "bindings/java",
+              "bindings/python"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Core API",
+            "pages": [
+              "api/db",
+              "api/db-builder",
+              "api/write-handle",
+              "api/db-iterator"
+            ]
+          },
+          {
+            "group": "Transactions",
+            "pages": [
+              "api/db-transaction",
+              "api/isolation-levels"
+            ]
+          },
+          {
+            "group": "Snapshots & Readers",
+            "pages": [
+              "api/db-snapshot",
+              "api/db-reader"
+            ]
+          },
+          {
+            "group": "Batching",
+            "pages": [
+              "api/write-batch"
+            ]
+          },
+          {
+            "group": "Configuration",
+            "pages": [
+              "api/settings",
+              "api/compactor-builder",
+              "api/garbage-collector-builder"
+            ]
+          },
+          {
+            "group": "Advanced",
+            "pages": [
+              "api/merge-operator",
+              "api/checkpoint",
+              "api/error-handling"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Resources",
+        "groups": [
+          {
+            "group": "Examples",
+            "pages": [
+              "examples/simple",
+              "examples/object-stores",
+              "examples/compaction",
+              "examples/snapshots"
+            ]
+          },
+          {
+            "group": "Community",
+            "pages": [
+              "community/contributing",
+              "community/governance",
+              "community/security"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "LSM-tree storage engine built on object storage (S3, GCS, ABS, MinIO)",
+    "Bottomless storage capacity with high durability and easy replication",
+    "ACID transactions with configurable isolation levels",
+    "Efficient range queries and prefix scanning with seek support",
+    "Compression support (Snappy, Zlib, LZ4, Zstd)",
+    "Block cache, disk cache, and bloom filters for performance",
+    "Automatic compaction with configurable strategies",
+    "Merge operators for atomic read-modify-write operations",
+    "Snapshots and checkpoints for consistent point-in-time reads",
+    "Change data capture (CDC) for streaming database changes",
+    "Language bindings for Rust, Go, Java, Python, and more"
+  ],
+  "publicApiSurface": [
+    "Db::open() - Open or create a database",
+    "Db::put() - Write a key-value pair",
+    "Db::get() - Read a value by key",
+    "Db::delete() - Delete a key",
+    "Db::scan() - Iterate over a range of keys",
+    "Db::scan_prefix() - Iterate over keys with a common prefix",
+    "Db::merge() - Apply a merge operation",
+    "Db::write() - Write a batch of operations",
+    "Db::begin() - Start a transaction",
+    "Db::snapshot() - Create a point-in-time snapshot",
+    "Db::flush() - Flush memtable to object storage",
+    "Db::close() - Close the database",
+    "DbBuilder - Configure and build a database instance",
+    "DbTransaction - Execute ACID transactions",
+    "DbSnapshot - Read from a consistent point-in-time view",
+    "DbIterator - Iterate over key-value pairs",
+    "WriteBatch - Batch multiple write operations",
+    "Settings - Configure database behavior",
+    "CompactorBuilder - Configure background compaction",
+    "GarbageCollectorBuilder - Configure garbage collection",
+    "MergeOperator - Define custom merge logic",
+    "Checkpoint - Create and restore checkpoints"
+  ]
+}
